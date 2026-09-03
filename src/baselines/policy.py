@@ -26,16 +26,25 @@ from .verification import (
     graph_label_propagation,
     misdetect_acquisition,
     misdetect_score,
+    noise_adjusted_posterior,
     observed_label_risk,
     robust_alc_acquisition,
     stratified_score_selection,
 )
 
 
+FROZEN_METHOD_BASE = {
+    "robust_alc_frozen": "robust_alc",
+    "dalc_frozen": "dalc",
+}
+FROZEN_METHODS = tuple(FROZEN_METHOD_BASE)
+
 BASELINE_METHODS = (
     *SCORE_CALIBRATION_METHODS,
     "robust_alc",
+    "robust_alc_frozen",
     "dalc",
+    "dalc_frozen",
     "active_label_cleaning",
     "active_label_correction",
     "graph_label_propagation",
@@ -51,11 +60,19 @@ STATUS_ONLY_METHODS = {
 }
 CORRECTION_METHODS = {
     "robust_alc",
+    "robust_alc_frozen",
+    "dalc",
+    "dalc_frozen",
+    "active_label_cleaning",
+    "active_label_correction",
+}
+WARM_START_METHODS = {
+    "robust_alc",
     "dalc",
     "active_label_cleaning",
     "active_label_correction",
 }
-FIXED_MODEL_METHODS = set(STATUS_ONLY_METHODS)
+FIXED_MODEL_METHODS = {*STATUS_ONLY_METHODS, *FROZEN_METHODS}
 NOISE_MODEL_METHODS = {"robust_alc", "dalc"}
 
 
@@ -136,19 +153,27 @@ def method_feedback_mode(method: str) -> str:
     raise ValueError(f"unknown method: {method}")
 
 
-def method_update_schedule(method: str) -> str:
+def method_update_schedule(method: str, *, warm_start: bool = False) -> str:
     if method in SCORE_CALIBRATION_METHODS:
         return "score_model_once_stratified_status_calibration_each_checkpoint"
     if method in {"graph_label_propagation", "cleannet", "misdetect_b"}:
         return "task_model_once_status_inference_each_budget_checkpoint"
+    if method == "robust_alc_frozen":
+        return "task_model_once_noise_transition_and_posterior_each_checkpoint"
+    if method == "dalc_frozen":
+        return "task_model_once_dual_query_and_noise_posterior_each_checkpoint"
     if method == "active_label_cleaning":
-        return "adapted_one_update_per_requested_budget_checkpoint"
+        schedule = "adapted_one_update_per_requested_budget_checkpoint"
+        return f"{schedule}_warm_start" if warm_start else schedule
     if method == "active_label_correction":
-        return "native_update_and_entropy_propagation_per_budget_checkpoint"
+        schedule = "native_update_and_entropy_propagation_per_budget_checkpoint"
+        return f"{schedule}_warm_start" if warm_start else schedule
     if method == "robust_alc":
-        return "adapted_noise_model_and_classifier_update_per_budget_checkpoint"
+        schedule = "adapted_noise_model_and_classifier_update_per_budget_checkpoint"
+        return f"{schedule}_warm_start" if warm_start else schedule
     if method == "dalc":
-        return "adapted_dual_query_and_noise_model_update_per_budget_checkpoint"
+        schedule = "adapted_dual_query_and_noise_model_update_per_budget_checkpoint"
+        return f"{schedule}_warm_start" if warm_start else schedule
     raise ValueError(f"unknown method: {method}")
 
 
@@ -168,9 +193,8 @@ class BaselinePolicy:
             raise ValueError(
                 f"unknown baseline {method!r}; choose from {BASELINE_METHODS}"
             )
-        if method == "cleannet" and modality != "image":
-            raise ValueError("CleanNet is image-only and cannot run on this dataset")
-        self.method = method
+        self.registered_method = method
+        self.method = FROZEN_METHOD_BASE.get(method, method)
         self.noisy_labels = np.asarray(noisy_labels, dtype=np.int64).copy()
         self.modality = modality
         self.seed = int(seed)
@@ -249,7 +273,34 @@ class BaselinePolicy:
                 rule,
             )
 
-        if self.method in {"robust_alc", "active_label_correction"}:
+        if self.method == "robust_alc":
+            score = observed_label_risk(artifacts, labels)
+            trusted = self.trusted_mask(queried)
+            transition = estimate_noise_transition(
+                artifacts.probability,
+                labels,
+                current_labels,
+                trusted,
+            )
+            posterior = noise_adjusted_posterior(
+                artifacts.probability,
+                labels,
+                transition,
+                current_labels,
+                trusted,
+            )
+            untrusted = ~trusted
+            score[untrusted] = 1.0 - posterior[
+                np.flatnonzero(untrusted), labels[untrusted]
+            ]
+            self.last_noise_transition = transition
+            return MethodPrediction(
+                score,
+                base_issue,
+                "final_classifier_class_differs_from_noisy_label",
+            )
+
+        if self.method == "active_label_correction":
             score = observed_label_risk(artifacts, labels)
             return MethodPrediction(
                 score,

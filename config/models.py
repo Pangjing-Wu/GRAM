@@ -3,16 +3,18 @@
 
 _IMAGE = {
     "model": "resnet18",
-    "epochs": 100,
-    "early_epochs": 10,
+    "epochs": 10,
+    "early_epochs": 2,
     "batch_size": 128,
     "optimizer": "sgd",
     "learning_rate": 0.1,
     "weight_decay": 5.0e-4,
     "momentum": 0.9,
-    "milestones": (50, 75),
+    "milestones": (5, 8),
     "lr_gamma": 0.1,
     "num_workers": 4,
+    "warm_start_epochs": 2,
+    "warm_start_learning_rate_factor": 0.1,
 }
 
 _TEXT = {
@@ -25,6 +27,8 @@ _TEXT = {
     "weight_decay": 0.01,
     "max_length": 128,
     "num_workers": 2,
+    "warm_start_epochs": 1,
+    "warm_start_learning_rate_factor": 0.1,
 }
 
 _TABULAR = {
@@ -37,6 +41,8 @@ _TABULAR = {
     "weight_decay": 1.0e-4,
     "hidden_dims": (256, 128, 64),
     "num_workers": 0,
+    "warm_start_epochs": 10,
+    "warm_start_learning_rate_factor": 0.1,
 }
 
 MODELS = {

@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from config import load_config
-from config.methods import METHOD_CONFIGS
+from config.methods import method_config, resolve_gram_variant
 
 from .detection import LabelVerificationOracle
 from .baselines.training import train_robust_selector
@@ -24,6 +24,7 @@ from .methods import (
 from .utils.budget import budget_schedule, validate_budget_checkpoints
 from .utils.data import load_data
 from .utils.noise import inject_noise
+from .utils.results import round_metric_floats
 from .utils.run_logging import run_logger
 from .utils.training import train_downstream_model, train_task_model
 
@@ -55,17 +56,24 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def downstream_output_dir(
-    root: Path, dataset: str, method: str, scenario: DownstreamScenario
+    root: Path,
+    dataset: str,
+    method: str,
+    scenario: DownstreamScenario,
+    gram_variant: str | None = None,
 ) -> Path:
-    return (
+    output = (
         root
         / "downstream"
         / dataset
         / scenario.noise_type
         / f"rho{scenario.rho:g}"
         / method
-        / f"seed{scenario.seed}"
     )
+    selected_variant = resolve_gram_variant(method, gram_variant)
+    if selected_variant is not None:
+        output /= selected_variant
+    return output / f"seed{scenario.seed}"
 
 
 # Kept for callers that imported the previous private helper.
@@ -79,11 +87,13 @@ def run_downstream_experiment(
     scenario: DownstreamScenario,
     data_root: str | Path,
     results_root: str | Path,
+    gram_variant: str | None = None,
 ) -> Path:
     """Run a deployment experiment independently of detection results."""
     scenario.validate()
     if method not in METHODS:
         raise ValueError(f"unknown method {method!r}; choose from {METHODS}")
+    selected_gram_variant = resolve_gram_variant(method, gram_variant)
     dataset_config, model_config = load_config(dataset)
     data_root, results_root = Path(data_root), Path(results_root)
     data = load_data(
@@ -126,6 +136,7 @@ def run_downstream_experiment(
     snapshots: list[dict] = []
     rows: list[dict] = []
     query_rows: list[dict] = []
+    kernel_weight_rows: list[dict] = []
     pseudo_rows: list[dict] = []
     policy = create_method_policy(
         method,
@@ -133,6 +144,7 @@ def run_downstream_experiment(
         modality=data.modality,
         seed=scenario.seed,
         native_features=(data.train_x if data.modality == "tabular" else None),
+        gram_variant=selected_gram_variant,
     )
     cached_artifacts = None
     previous_artifacts = None
@@ -180,6 +192,17 @@ def run_downstream_experiment(
         prediction = policy.predict(
             artifacts, method_labels, queried, queried_status
         )
+        kernel_weight_state = None
+        if method == "ours":
+            kernel_weight_state = policy.kernel_weight_state()
+            kernel_weight_rows.append(
+                {
+                    "checkpoint": checkpoint_index,
+                    "configured_budget_fraction": configured_budget,
+                    "queried_count": int(queried.sum()),
+                    **kernel_weight_state,
+                }
+            )
         global_score = prediction.score
         predicted_issue = prediction.predicted_issue
         decision_rule = prediction.decision_rule
@@ -262,23 +285,30 @@ def run_downstream_experiment(
             verification.true_labels,
             verification.mislabel_status,
         ):
-            query_rows.append(
-                {
-                    "budget_checkpoint": checkpoint_index + 1,
-                    "configured_budget_fraction": configured_budgets[checkpoint_index],
-                    "sample_id": int(sample_id),
-                    "was_mislabeled": int(status),
-                    "noisy_label": int(noisy_labels[sample_id]),
-                    "verified_label": int(verified_label),
-                    "feedback_used_by_method": method_feedback_mode(method),
-                    "acquisition_score": float(result.score[sample_id]),
-                    "posterior_variance": (
-                        float(result.posterior_variance[sample_id])
-                        if result.posterior_variance is not None
-                        else None
-                    ),
-                }
-            )
+            query_row = {
+                "budget_checkpoint": checkpoint_index + 1,
+                "configured_budget_fraction": configured_budgets[checkpoint_index],
+                "sample_id": int(sample_id),
+                "was_mislabeled": int(status),
+                "noisy_label": int(noisy_labels[sample_id]),
+                "verified_label": int(verified_label),
+                "feedback_used_by_method": method_feedback_mode(method),
+                "acquisition_score": float(result.score[sample_id]),
+                "posterior_variance": (
+                    float(result.posterior_variance[sample_id])
+                    if result.posterior_variance is not None
+                    else None
+                ),
+            }
+            if kernel_weight_state is not None:
+                query_row.update(
+                    {
+                        "omega_margin": kernel_weight_state["omega_margin"],
+                        "omega_gradient": kernel_weight_state["omega_gradient"],
+                        "omega_identity": kernel_weight_state["omega_identity"],
+                    }
+                )
+            query_rows.append(query_row)
         queried[selected] = True
         queried_status[selected] = verification.mislabel_status
         repaired_labels[selected] = verification.true_labels
@@ -416,6 +446,7 @@ def run_downstream_experiment(
         "reuses_detection_results": False,
         "dataset": dataset,
         "method": method,
+        "gram_variant": selected_gram_variant,
         **asdict(scenario),
         "feedback_mode": feedback_mode,
         "update_schedule": update_schedule,
@@ -438,14 +469,31 @@ def run_downstream_experiment(
         ],
         "elapsed_seconds": time.perf_counter() - total_started,
     }
-    output = downstream_output_dir(results_root, dataset, method, scenario)
+    if kernel_weight_rows:
+        summary.update(
+            {
+                "final_omega_margin": kernel_weight_rows[-1]["omega_margin"],
+                "final_omega_gradient": kernel_weight_rows[-1]["omega_gradient"],
+                "final_omega_identity": kernel_weight_rows[-1]["omega_identity"],
+            }
+        )
+    output = downstream_output_dir(
+        results_root, dataset, method, scenario, selected_gram_variant
+    )
     output.mkdir(parents=True, exist_ok=True)
-    _write_csv(output / "downstream_metrics.csv", rows)
+    _write_csv(output / "downstream_metrics.csv", round_metric_floats(rows))
     _write_csv(output / "queries.csv", query_rows)
+    _write_csv(output / "kernel_weights.csv", kernel_weight_rows)
     _write_csv(output / "pseudo_labels.csv", pseudo_rows)
     _write_csv(output / "extrapolation_predictions.csv", prediction_rows)
     with (output / "summary.json").open("w", encoding="utf-8") as stream:
-        json.dump(summary, stream, indent=2, sort_keys=True, allow_nan=False)
+        json.dump(
+            round_metric_floats(summary),
+            stream,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
     with (output / "config.json").open("w", encoding="utf-8") as stream:
         json.dump(
             {
@@ -453,10 +501,11 @@ def run_downstream_experiment(
                 "reuses_detection_results": False,
                 "dataset": dataset,
                 "method": method,
+                "gram_variant": selected_gram_variant,
                 "scenario": asdict(scenario),
                 "dataset_config": dataset_config,
                 "model_config": model_config,
-                "method_config": METHOD_CONFIGS.get(method, {}),
+                "method_config": method_config(method, selected_gram_variant),
                 "feedback_mode": feedback_mode,
                 "update_schedule": update_schedule,
                 "binary_decision_rule": decision_rule,

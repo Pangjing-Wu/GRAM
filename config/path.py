@@ -9,9 +9,8 @@ class PathConfig:
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-AMADE_ROOT = PROJECT_ROOT.parent / "amade"
 
 PATHS = PathConfig(
-    data_root=AMADE_ROOT / "datasets",
+    data_root=PROJECT_ROOT / "datasets",
     results_root=PROJECT_ROOT / "results",
 )

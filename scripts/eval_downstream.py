@@ -13,6 +13,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.datasets import DATASETS
+from config.methods import GRAM_VARIANTS, resolve_gram_variant
 from config.path import PATHS
 from src.downstream_experiment import (
     DownstreamScenario,
@@ -21,7 +22,11 @@ from src.downstream_experiment import (
 )
 from src.methods import METHODS
 from src.utils.budget import noise_rate_budget_checkpoints
-from src.utils.run_logging import configure_run_logging, write_run_arguments
+from src.utils.run_logging import (
+    configure_run_logging,
+    ensure_output_available,
+    write_run_arguments,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--dataset", required=True, choices=sorted(DATASETS))
     parser.add_argument("--method", required=True, choices=METHODS)
+    parser.add_argument(
+        "--gram_variant",
+        choices=tuple(GRAM_VARIANTS),
+        default=None,
+        help="GRAM configuration variant; defaults to the main variant for --method=ours",
+    )
     parser.add_argument(
         "--noise_type",
         choices=("symmetric", "pairflip", "instance"),
@@ -47,11 +58,17 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="replace files in an existing result directory",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    selected_gram_variant = resolve_gram_variant(args.method, args.gram_variant)
     budgets = noise_rate_budget_checkpoints(args.rho)
     scenario = DownstreamScenario(
         args.noise_type,
@@ -60,26 +77,33 @@ def main() -> None:
         args.seed,
     )
     output = downstream_output_dir(
-        PATHS.results_root, args.dataset, args.method, scenario
+        PATHS.results_root,
+        args.dataset,
+        args.method,
+        scenario,
+        selected_gram_variant,
     )
+    ensure_output_available(output, args.overwrite)
     write_run_arguments(
         output,
         {
             "protocol": "downstream",
             **vars(args),
+            "gram_variant": selected_gram_variant,
             "budget_checkpoints": list(budgets),
             "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
             "command": shlex.join(sys.argv),
             "output_dir": str(output),
         },
     )
-    logger = configure_run_logging(output)
+    logger = configure_run_logging(output, overwrite=args.overwrite)
     started = time.perf_counter()
     logger.info(
-        "run_started protocol=downstream dataset=%s method=%s noise=%s rho=%g "
-        "seed=%d cuda_visible_devices=%s command=%s output_dir=%s",
+        "run_started protocol=downstream dataset=%s method=%s gram_variant=%s "
+        "noise=%s rho=%g seed=%d cuda_visible_devices=%s command=%s output_dir=%s",
         args.dataset,
         args.method,
+        selected_gram_variant,
         args.noise_type,
         args.rho,
         args.seed,
@@ -94,6 +118,7 @@ def main() -> None:
             scenario=scenario,
             data_root=PATHS.data_root,
             results_root=PATHS.results_root,
+            gram_variant=selected_gram_variant,
         )
     except BaseException:
         logger.exception(

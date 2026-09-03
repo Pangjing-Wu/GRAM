@@ -4,6 +4,7 @@ import random
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Mapping
 
 import numpy as np
 import torch
@@ -81,9 +82,25 @@ class TrainingArtifacts:
     forgetting: np.ndarray
     forgetting_count: np.ndarray
     learned: np.ndarray
+    margin_trajectory: np.ndarray
+    gradient_trajectory: np.ndarray
     test_accuracy: float
     test_macro_f1: float
     train_seconds: float
+    model_state: dict[str, torch.Tensor] | None = None
+    training_epochs: int = 0
+    warm_started: bool = False
+    epoch_offset: int = 0
+
+
+def warm_start_training_options(config: dict) -> tuple[int, float]:
+    epochs = int(config.get("warm_start_epochs", config["epochs"]))
+    factor = float(config.get("warm_start_learning_rate_factor", 1.0))
+    if epochs <= 0:
+        raise ValueError("warm-start epochs must be positive")
+    if not np.isfinite(factor) or factor <= 0.0:
+        raise ValueError("warm-start learning-rate factor must be positive and finite")
+    return epochs, float(config["learning_rate"]) * factor
 
 
 def _image_transforms(dataset: str):
@@ -123,6 +140,18 @@ def _features_and_logits(model, values):
     else:
         features = model.forward_features(values)
     return features, model.classifier(features)
+
+
+def _training_features_and_logits(model, values):
+    """Return the features consumed by the final linear classifier and logits."""
+    if isinstance(values, dict):
+        features = model.forward_features(**values)
+    else:
+        features = model.forward_features(values)
+    classifier_features = (
+        model.dropout(features) if hasattr(model, "dropout") else features
+    )
+    return classifier_features, model.classifier(classifier_features)
 
 
 def _batch_plan(
@@ -214,12 +243,15 @@ def _infer_losses(
     return losses
 
 
-def _optimizer(model, config: dict):
+def _optimizer(model, config: dict, learning_rate: float | None = None):
     name = config["optimizer"]
+    active_learning_rate = (
+        config["learning_rate"] if learning_rate is None else float(learning_rate)
+    )
     if name == "sgd":
         return torch.optim.SGD(
             model.parameters(),
-            lr=config["learning_rate"],
+            lr=active_learning_rate,
             momentum=config["momentum"],
             weight_decay=config["weight_decay"],
             nesterov=True,
@@ -227,7 +259,7 @@ def _optimizer(model, config: dict):
     optimizer_class = torch.optim.AdamW if name == "adamw" else torch.optim.Adam
     return optimizer_class(
         model.parameters(),
-        lr=config["learning_rate"],
+        lr=active_learning_rate,
         weight_decay=config["weight_decay"],
     )
 
@@ -244,13 +276,29 @@ def _fit_model(
     training_reference_count: int | None = None,
     noise_transition: np.ndarray | None = None,
     trusted_mask: np.ndarray | None = None,
+    initial_model_state: Mapping[str, torch.Tensor] | None = None,
+    training_epochs: int | None = None,
+    learning_rate: float | None = None,
+    epoch_offset: int = 0,
+    initial_contribution: np.ndarray | None = None,
 ):
     started = time.perf_counter()
     robust = contribution_config is not None
     device = resolve_device()
     seed_everything(seed)
-    model = build_model(data, config, str(cache_dir)).to(device)
-    optimizer = _optimizer(model, config)
+    model = build_model(data, config, str(cache_dir))
+    if initial_model_state is not None:
+        model.load_state_dict(initial_model_state, strict=True)
+    model = model.to(device)
+    optimizer = _optimizer(model, config, learning_rate)
+    active_epochs = (
+        config["epochs"] if training_epochs is None else int(training_epochs)
+    )
+    if active_epochs <= 0:
+        raise ValueError("training epochs must be positive")
+    epoch_offset = int(epoch_offset)
+    if epoch_offset < 0:
+        raise ValueError("epoch offset must be non-negative")
     scheduler = (
         torch.optim.lr_scheduler.MultiStepLR(
             optimizer, milestones=config["milestones"], gamma=config["lr_gamma"]
@@ -277,7 +325,23 @@ def _fit_model(
     previous_correct = np.zeros(count, dtype=bool)
     learned = np.zeros(count, dtype=bool)
     forgetting_count = np.zeros(count, dtype=np.int64)
+    margin_trajectory = np.empty((count, active_epochs), dtype=np.float32)
+    gradient_trajectory = np.empty((count, active_epochs), dtype=np.float32)
     contribution = np.full(count, 1.0 / count, dtype=np.float64)
+    if initial_contribution is not None:
+        if not robust:
+            raise ValueError("contribution state is only valid for robust training")
+        contribution = np.asarray(initial_contribution, dtype=np.float64).reshape(-1)
+        if (
+            contribution.shape != (count,)
+            or not np.all(np.isfinite(contribution))
+            or np.any(contribution < 0.0)
+            or contribution.sum() <= 0.0
+        ):
+            raise ValueError(
+                "initial contribution state must be finite and non-negative"
+            )
+        contribution = contribution / contribution.sum()
     transition_tensor = None
     local_trusted = None
     if noise_transition is not None:
@@ -305,7 +369,11 @@ def _fit_model(
             else full_trusted[np.asarray(train_ids, dtype=np.int64)]
         )
 
-    for epoch in range(1, config["epochs"] + 1):
+    for local_epoch in range(1, active_epochs + 1):
+        epoch = epoch_offset + local_epoch
+        epoch_margin_sum = np.zeros(count, dtype=np.float64)
+        epoch_gradient_sum = np.zeros(count, dtype=np.float64)
+        epoch_observation_count = np.zeros(count, dtype=np.int64)
         epoch_seed = int(np.random.SeedSequence([seed, epoch]).generate_state(1)[0])
         seed_everything(epoch_seed)
         batches = _batch_plan(
@@ -327,7 +395,7 @@ def _fit_model(
             values = _move(values, device)
             batch_labels = batch_labels.to(device, non_blocking=True)
             optimizer.zero_grad(set_to_none=True)
-            logits = _logits(model, values)
+            classifier_features, logits = _training_features_and_logits(model, values)
             ordinary_losses = functional.cross_entropy(
                 logits, batch_labels, reduction="none"
             )
@@ -344,7 +412,7 @@ def _fit_model(
                     local_trusted[positions], dtype=torch.bool, device=device
                 )
                 losses = torch.where(trusted, ordinary_losses, losses)
-            if epoch <= config["early_epochs"]:
+            if local_epoch <= config["early_epochs"]:
                 np.add.at(early_sum, positions, ordinary_losses.detach().double().cpu().numpy())
                 np.add.at(early_count, positions, 1)
 
@@ -354,8 +422,23 @@ def _fit_model(
             assigned = detached_logits[row, detached_labels]
             alternative = detached_logits.copy()
             alternative[row, detached_labels] = -np.inf
-            np.add.at(aum_sum, positions, assigned - alternative.max(axis=1))
+            margin = assigned - alternative.max(axis=1)
+            np.add.at(aum_sum, positions, margin)
             np.add.at(aum_count, positions, 1)
+            detached_probability = torch.softmax(
+                logits.detach(), dim=1
+            ).float().cpu().numpy()
+            residual = detached_probability
+            residual[row, detached_labels] -= 1.0
+            detached_features = (
+                classifier_features.detach().float().cpu().numpy()
+            )
+            gradient_norm = np.linalg.norm(residual, axis=1) * np.sqrt(
+                1.0 + np.einsum("ij,ij->i", detached_features, detached_features)
+            )
+            np.add.at(epoch_margin_sum, positions, margin)
+            np.add.at(epoch_gradient_sum, positions, gradient_norm)
+            np.add.at(epoch_observation_count, positions, 1)
             correct = detached_logits.argmax(axis=1) == detached_labels
             forgetting_count[positions] += previous_correct[positions] & ~correct
             learned[positions] |= correct
@@ -370,6 +453,15 @@ def _fit_model(
                 loss = losses.mean()
             loss.backward()
             optimizer.step()
+
+        if np.any(epoch_observation_count == 0):
+            raise RuntimeError("trajectory collection missed a training sample")
+        margin_trajectory[:, local_epoch - 1] = (
+            epoch_margin_sum / epoch_observation_count
+        )
+        gradient_trajectory[:, local_epoch - 1] = (
+            epoch_gradient_sum / epoch_observation_count
+        )
 
         if robust:
             epoch_losses = _infer_losses(
@@ -402,6 +494,8 @@ def _fit_model(
         aum_sum / np.maximum(aum_count, 1),
         forgetting_count,
         learned,
+        margin_trajectory,
+        gradient_trajectory,
         contribution,
         device,
         time.perf_counter() - started,
@@ -421,6 +515,11 @@ def train_task_model(
     evaluate_test: bool = True,
     noise_transition: np.ndarray | None = None,
     trusted_mask: np.ndarray | None = None,
+    initial_model_state: Mapping[str, torch.Tensor] | None = None,
+    training_epochs: int | None = None,
+    learning_rate: float | None = None,
+    capture_model_state: bool = False,
+    epoch_offset: int = 0,
 ) -> TrainingArtifacts:
     (
         model,
@@ -429,6 +528,8 @@ def train_task_model(
         aum,
         forgetting_count,
         learned,
+        margin_trajectory,
+        gradient_trajectory,
         _,
         device,
         train_seconds,
@@ -444,6 +545,10 @@ def train_task_model(
         training_reference_count=training_reference_count,
         noise_transition=noise_transition,
         trusted_mask=trusted_mask,
+        initial_model_state=initial_model_state,
+        training_epochs=training_epochs,
+        learning_rate=learning_rate,
+        epoch_offset=epoch_offset,
     )
     probability, embedding, final_loss = _infer(
         model,
@@ -485,9 +590,26 @@ def train_task_model(
         ).astype(np.float64),
         forgetting_count=forgetting_count,
         learned=learned,
+        margin_trajectory=margin_trajectory,
+        gradient_trajectory=gradient_trajectory,
         test_accuracy=accuracy,
         test_macro_f1=macro_f1,
         train_seconds=train_seconds,
+        model_state=(
+            {
+                name: value.detach().cpu().clone()
+                for name, value in model.state_dict().items()
+            }
+            if capture_model_state
+            else None
+        ),
+        training_epochs=(
+            int(config["epochs"])
+            if training_epochs is None
+            else int(training_epochs)
+        ),
+        warm_started=initial_model_state is not None,
+        epoch_offset=int(epoch_offset),
     )
 
 

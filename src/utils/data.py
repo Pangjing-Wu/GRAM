@@ -8,15 +8,16 @@ import numpy as np
 
 
 class ImageInputs:
-    def __init__(self, source):
+    def __init__(self, source, image_column: str | None = None):
         self.source = source
+        self.image_column = image_column
 
     def __len__(self) -> int:
         return len(self.source)
 
     def __getitem__(self, index: int):
-        image, _ = self.source[int(index)]
-        return image
+        row = self.source[int(index)]
+        return row[self.image_column] if self.image_column is not None else row[0]
 
 
 @dataclass
@@ -63,21 +64,36 @@ def _pooled_cifar_features(images: np.ndarray) -> np.ndarray:
     return values.reshape(-1, 8, 4, 8, 4, 3).mean((2, 4)).reshape(len(values), -1)
 
 
-def _load_cifar(name: str, root: Path, config: dict) -> TaskData:
-    from torchvision.datasets import CIFAR10, CIFAR100
+def _pooled_huggingface_image_features(dataset, image_column: str) -> np.ndarray:
+    features = np.empty((len(dataset), 8 * 8 * 3), dtype=np.float32)
+    for start in range(0, len(dataset), 1000):
+        stop = min(start + 1000, len(dataset))
+        images = np.stack(
+            [np.asarray(dataset[index][image_column]) for index in range(start, stop)]
+        )
+        features[start:stop] = _pooled_cifar_features(images)
+    return features
 
-    dataset_class = CIFAR10 if name == "cifar10" else CIFAR100
-    data_root = root / "cv" / name.upper().replace("CIFAR", "CIFAR-")
-    train = dataset_class(str(data_root), train=True, download=True)
-    test = dataset_class(str(data_root), train=False, download=True)
+
+def _load_cifar(name: str, root: Path, config: dict) -> TaskData:
+    from datasets import load_dataset
+
+    raw = load_dataset(
+        "parquet",
+        data_files=config["data_files"],
+        cache_dir=str(root / "huggingface"),
+    )
+    train, test = raw["train"], raw["test"]
+    image_column = config["image_column"]
+    label_column = config["label_column"]
     return TaskData(
         name=name,
         modality="image",
-        train_x=ImageInputs(train),
-        test_x=ImageInputs(test),
-        clean_train_y=np.asarray(train.targets),
-        test_y=np.asarray(test.targets),
-        noise_x=_pooled_cifar_features(train.data),
+        train_x=ImageInputs(train, image_column),
+        test_x=ImageInputs(test, image_column),
+        clean_train_y=np.asarray(train[label_column]),
+        test_y=np.asarray(test[label_column]),
+        noise_x=_pooled_huggingface_image_features(train, image_column),
         num_classes=config["num_classes"],
         test_metric=config["test_metric"],
     )

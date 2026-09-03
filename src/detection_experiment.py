@@ -9,23 +9,26 @@ from pathlib import Path
 import numpy as np
 
 from config import load_config
-from config.methods import METHOD_CONFIGS
+from config.methods import method_config, resolve_gram_variant
 
 from .detection import DetectionMetrics, LabelVerificationOracle, evaluate_detection
 from .baselines.training import train_robust_selector
 from .methods import (
     CORRECTION_METHODS,
     METHODS,
+    WARM_START_METHODS,
     create_method_policy,
     method_feedback_mode,
     method_update_schedule,
     should_train_acquisition_model,
 )
-from .utils.budget import budget_schedule, budget_tag, validate_budget_checkpoints
+from .utils.budget import budget_schedule, validate_budget_checkpoints
 from .utils.data import load_data
 from .utils.noise import inject_noise
+from .utils.results import round_metric_floats
 from .utils.run_logging import run_logger
-from .utils.training import train_task_model
+from .utils.training import train_task_model, warm_start_training_options
+from .utils.training_cache import load_or_create_shared_training_artifact
 
 
 @dataclass(frozen=True)
@@ -57,17 +60,24 @@ def _write_csv(path: Path, rows: list[dict]) -> None:
 
 
 def detection_output_dir(
-    root: Path, dataset: str, method: str, scenario: DetectionScenario
+    root: Path,
+    dataset: str,
+    method: str,
+    scenario: DetectionScenario,
+    gram_variant: str | None = None,
 ) -> Path:
-    return (
+    output = (
         root
         / "detection"
         / dataset
         / scenario.noise_type
-        / f"rho{scenario.rho:g}_B{budget_tag(tuple(scenario.budgets))}"
+        / f"rho{scenario.rho:g}"
         / method
-        / f"seed{scenario.seed}"
     )
+    selected_variant = resolve_gram_variant(method, gram_variant)
+    if selected_variant is not None:
+        output /= selected_variant
+    return output / f"seed{scenario.seed}"
 
 
 def _finite_or_none(value: float) -> float | None:
@@ -99,10 +109,12 @@ def run_detection_experiment(
     scenario: DetectionScenario,
     data_root: str | Path,
     results_root: str | Path,
+    gram_variant: str | None = None,
 ) -> Path:
     scenario.validate()
     if method not in METHODS:
         raise ValueError(f"unknown method {method!r}; choose from {METHODS}")
+    selected_gram_variant = resolve_gram_variant(method, gram_variant)
     dataset_config, model_config = load_config(dataset)
     data_root, results_root = Path(data_root), Path(results_root)
     data = load_data(
@@ -140,6 +152,7 @@ def run_detection_experiment(
     queried_status = np.zeros(data.sample_count, dtype=np.int64)
     rows: list[dict] = []
     query_rows: list[dict] = []
+    kernel_weight_rows: list[dict] = []
     pseudo_rows: list[dict] = []
     detection_snapshots: list[dict] = []
     policy = create_method_policy(
@@ -148,53 +161,157 @@ def run_detection_experiment(
         modality=data.modality,
         seed=scenario.seed,
         native_features=(data.train_x if data.modality == "tabular" else None),
+        gram_variant=selected_gram_variant,
     )
     cached_artifacts = None
     previous_artifacts = None
+    shared_training = None
+    algorithmic_model_state_count = 0
+    local_training_invocation_count = 0
+    total_training_epochs = 0
+    local_training_seconds = 0.0
     total_started = time.perf_counter()
 
     for checkpoint_index, configured_budget in enumerate(checkpoint_budgets):
         train_now = should_train_acquisition_model(method, checkpoint_index)
         model_reused = not train_now
         selector_train_seconds = 0.0
+        round_training_epochs = 0
+        warm_started = False
         if model_reused:
             if cached_artifacts is None:
                 raise RuntimeError("acquisition model requested before initial training")
             artifacts = cached_artifacts
             round_train_seconds = 0.0
         else:
+            algorithmic_model_state_count += 1
             if method == "active_label_correction":
+                if checkpoint_index:
+                    if (
+                        previous_artifacts is None
+                        or previous_artifacts.model_state is None
+                    ):
+                        raise RuntimeError("warm start requested without selector model state")
+                    update_epochs, update_learning_rate = warm_start_training_options(
+                        model_config
+                    )
+                    initial_model_state = previous_artifacts.model_state
+                    epoch_offset = total_training_epochs
+                else:
+                    update_epochs = update_learning_rate = None
+                    initial_model_state = None
+                    epoch_offset = 0
                 artifacts = train_robust_selector(
                     data,
                     training_labels,
                     config=model_config,
                     seed=scenario.seed,
                     cache_dir=data_root / "huggingface",
+                    initial_model_state=initial_model_state,
+                    training_epochs=update_epochs,
+                    learning_rate=update_learning_rate,
+                    epoch_offset=epoch_offset,
+                    initial_contribution=(
+                        None
+                        if previous_artifacts is None
+                        else previous_artifacts.contribution
+                    ),
                 )
                 round_train_seconds = 0.0
                 selector_train_seconds = artifacts.train_seconds
+                local_training_invocation_count += 1
             else:
-                transition, trusted = policy.training_transition(
-                    previous_artifacts, training_labels, queried
-                )
-                artifacts = train_task_model(
-                    data,
-                    training_labels,
-                    config=model_config,
-                    seed=scenario.seed,
-                    cache_dir=data_root / "huggingface",
-                    evaluate_test=False,
-                    noise_transition=transition,
-                    trusted_mask=trusted,
-                )
-                round_train_seconds = artifacts.train_seconds
+                if checkpoint_index == 0:
+                    shared_training = load_or_create_shared_training_artifact(
+                        cache_root=results_root
+                        / "detection"
+                        / "_shared_training_artifacts",
+                        dataset=dataset,
+                        noise_type=scenario.noise_type,
+                        rho=scenario.rho,
+                        seed=scenario.seed,
+                        dataset_config=dataset_config,
+                        model_config=model_config,
+                        noisy_labels=noisy_labels,
+                        load_model_state=method in WARM_START_METHODS,
+                        trainer=lambda: train_task_model(
+                            data,
+                            training_labels,
+                            config=model_config,
+                            seed=scenario.seed,
+                            cache_dir=data_root / "huggingface",
+                            evaluate_test=False,
+                            capture_model_state=True,
+                        ),
+                    )
+                    artifacts = shared_training.artifacts
+                    round_train_seconds = (
+                        0.0
+                        if shared_training.cache_hit
+                        else shared_training.source_train_seconds
+                    )
+                    local_training_invocation_count += int(
+                        not shared_training.cache_hit
+                    )
+                    run_logger.info(
+                        "shared_training_artifact_ready cache_hit=%s fingerprint=%s "
+                        "directory=%s source_train_seconds=%.3f",
+                        shared_training.cache_hit,
+                        shared_training.fingerprint,
+                        shared_training.directory,
+                        shared_training.source_train_seconds,
+                    )
+                else:
+                    if (
+                        previous_artifacts is None
+                        or previous_artifacts.model_state is None
+                    ):
+                        raise RuntimeError("warm start requested without task-model state")
+                    transition, trusted = policy.training_transition(
+                        previous_artifacts, training_labels, queried
+                    )
+                    update_epochs, update_learning_rate = warm_start_training_options(
+                        model_config
+                    )
+                    artifacts = train_task_model(
+                        data,
+                        training_labels,
+                        config=model_config,
+                        seed=scenario.seed,
+                        cache_dir=data_root / "huggingface",
+                        evaluate_test=False,
+                        noise_transition=transition,
+                        trusted_mask=trusted,
+                        initial_model_state=previous_artifacts.model_state,
+                        training_epochs=update_epochs,
+                        learning_rate=update_learning_rate,
+                        capture_model_state=True,
+                        epoch_offset=total_training_epochs,
+                    )
+                    round_train_seconds = artifacts.train_seconds
+                    local_training_invocation_count += 1
             cached_artifacts = artifacts
             previous_artifacts = artifacts
+            round_training_epochs = int(artifacts.training_epochs)
+            warm_started = bool(artifacts.warm_started)
+            total_training_epochs += round_training_epochs
+            local_training_seconds += round_train_seconds + selector_train_seconds
 
         prediction_started = time.perf_counter()
         prediction = policy.predict(
             artifacts, training_labels, queried, queried_status
         )
+        kernel_weight_state = None
+        if method == "ours":
+            kernel_weight_state = policy.kernel_weight_state()
+            kernel_weight_rows.append(
+                {
+                    "checkpoint": checkpoint_index,
+                    "configured_budget_fraction": configured_budget,
+                    "queried_count": int(queried.sum()),
+                    **kernel_weight_state,
+                }
+            )
         global_score = np.asarray(prediction.score, dtype=np.float64)
         expected_shape = (data.sample_count,)
         if global_score.shape != expected_shape or not np.all(
@@ -225,6 +342,8 @@ def run_detection_experiment(
                 "train_seconds": round_train_seconds,
                 "task_model_reused": model_reused,
                 "selector_train_seconds": selector_train_seconds,
+                "training_epochs": round_training_epochs,
+                "warm_started": warm_started,
                 "prediction_and_query_seconds": 0.0,
             }
             rows.append(row)
@@ -285,23 +404,30 @@ def run_detection_experiment(
             verification.true_labels,
             verification.mislabel_status,
         ):
-            query_rows.append(
-                {
-                    "budget_checkpoint": checkpoint_index + 1,
-                    "configured_budget_fraction": configured_budgets[checkpoint_index],
-                    "sample_id": int(sample_id),
-                    "was_mislabeled": int(status),
-                    "noisy_label": int(noisy_labels[sample_id]),
-                    "verified_label": int(verified_label),
-                    "feedback_used_by_method": method_feedback_mode(method),
-                    "acquisition_score": float(result.score[sample_id]),
-                    "posterior_variance": (
-                        float(result.posterior_variance[sample_id])
-                        if result.posterior_variance is not None
-                        else None
-                    ),
-                }
-            )
+            query_row = {
+                "budget_checkpoint": checkpoint_index + 1,
+                "configured_budget_fraction": configured_budgets[checkpoint_index],
+                "sample_id": int(sample_id),
+                "was_mislabeled": int(status),
+                "noisy_label": int(noisy_labels[sample_id]),
+                "verified_label": int(verified_label),
+                "feedback_used_by_method": method_feedback_mode(method),
+                "acquisition_score": float(result.score[sample_id]),
+                "posterior_variance": (
+                    float(result.posterior_variance[sample_id])
+                    if result.posterior_variance is not None
+                    else None
+                ),
+            }
+            if kernel_weight_state is not None:
+                query_row.update(
+                    {
+                        "omega_margin": kernel_weight_state["omega_margin"],
+                        "omega_gradient": kernel_weight_state["omega_gradient"],
+                        "omega_identity": kernel_weight_state["omega_identity"],
+                    }
+                )
+            query_rows.append(query_row)
         queried[selected] = True
         queried_status[selected] = verification.mislabel_status
         if method in CORRECTION_METHODS:
@@ -383,12 +509,16 @@ def run_detection_experiment(
         for sample_id in range(data.sample_count)
     ]
     feedback_mode = method_feedback_mode(method)
-    update_schedule = method_update_schedule(method)
+    warm_start_enabled = method in WARM_START_METHODS
+    update_schedule = method_update_schedule(
+        method, warm_start=warm_start_enabled
+    )
     summary = {
         "protocol": "full_pool_detection",
         "reuses_downstream_results": False,
         "dataset": dataset,
         "method": method,
+        "gram_variant": selected_gram_variant,
         **asdict(scenario),
         "feedback_mode": feedback_mode,
         "update_schedule": update_schedule,
@@ -399,6 +529,17 @@ def run_detection_experiment(
         "actual_budget_fraction": float(queried.mean()),
         "unverified_count_at_max_budget": int((~queried).sum()),
         "internal_pseudo_label_count_at_max_budget": int(policy.pseudo_mask.sum()),
+        "algorithmic_model_state_count": algorithmic_model_state_count,
+        "local_training_invocation_count": local_training_invocation_count,
+        "total_training_epochs": total_training_epochs,
+        "local_training_seconds": local_training_seconds,
+        "warm_start_enabled": warm_start_enabled,
+        "shared_training_artifact_cache_hit": (
+            None if shared_training is None else shared_training.cache_hit
+        ),
+        "shared_training_artifact_fingerprint": (
+            None if shared_training is None else shared_training.fingerprint
+        ),
         "aubc_full_auprc": _finite_or_none(
             _normalized_curve_area(
                 full_auprc_curve, actual_budgets, actual_budgets[-1]
@@ -412,20 +553,37 @@ def run_detection_experiment(
         "diagnostic_query_precision_at_max_budget": float(rows[-1]["query_precision"]),
         "elapsed_seconds": time.perf_counter() - total_started,
     }
+    if kernel_weight_rows:
+        summary.update(
+            {
+                "final_omega_margin": kernel_weight_rows[-1]["omega_margin"],
+                "final_omega_gradient": kernel_weight_rows[-1]["omega_gradient"],
+                "final_omega_identity": kernel_weight_rows[-1]["omega_identity"],
+            }
+        )
     for subset, metrics in (
         ("full", full_metrics[-1]),
         ("unverified", unverified_metrics[-1]),
     ):
         summary[f"{subset}_auprc_at_max_budget"] = _finite_or_none(metrics.auprc)
         summary[f"{subset}_auroc_at_max_budget"] = _finite_or_none(metrics.auroc)
-    output = detection_output_dir(results_root, dataset, method, scenario)
+    output = detection_output_dir(
+        results_root, dataset, method, scenario, selected_gram_variant
+    )
     output.mkdir(parents=True, exist_ok=True)
-    _write_csv(output / "metrics.csv", rows)
+    _write_csv(output / "metrics.csv", round_metric_floats(rows))
     _write_csv(output / "queries.csv", query_rows)
+    _write_csv(output / "kernel_weights.csv", kernel_weight_rows)
     _write_csv(output / "pseudo_labels.csv", pseudo_rows)
     _write_csv(output / "predictions.csv", prediction_rows)
     with (output / "summary.json").open("w", encoding="utf-8") as stream:
-        json.dump(summary, stream, indent=2, sort_keys=True, allow_nan=False)
+        json.dump(
+            round_metric_floats(summary),
+            stream,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        )
     with (output / "config.json").open("w", encoding="utf-8") as stream:
         json.dump(
             {
@@ -433,15 +591,59 @@ def run_detection_experiment(
                 "reuses_downstream_results": False,
                 "dataset": dataset,
                 "method": method,
+                "gram_variant": selected_gram_variant,
                 "scenario": asdict(scenario),
                 "dataset_config": dataset_config,
                 "model_config": model_config,
-                "method_config": METHOD_CONFIGS.get(method, {}),
+                "method_config": method_config(method, selected_gram_variant),
                 "feedback_mode": feedback_mode,
                 "update_schedule": update_schedule,
                 "primary_evaluation_set": "unverified_training_set",
                 "evaluation_sets": ["full_training_set", "unverified_training_set"],
                 "ground_truth_usage": "offline_metrics_after_complete_query_trajectory",
+                "training_protocol": {
+                    "base_training_artifact_shared_across_methods": shared_training
+                    is not None,
+                    "shared_training_artifact_cache_hit": (
+                        None if shared_training is None else shared_training.cache_hit
+                    ),
+                    "shared_training_artifact_fingerprint": (
+                        None
+                        if shared_training is None
+                        else shared_training.fingerprint
+                    ),
+                    "shared_training_artifact_directory": (
+                        None
+                        if shared_training is None
+                        else str(shared_training.directory)
+                    ),
+                    "warm_start_enabled": warm_start_enabled,
+                    "warm_start_state": (
+                        "previous_checkpoint_model_weights"
+                        if warm_start_enabled
+                        else None
+                    ),
+                    "warm_start_optimizer": (
+                        "fresh_optimizer" if warm_start_enabled else None
+                    ),
+                    "initial_training_epochs": int(model_config["epochs"]),
+                    "warm_start_epochs": (
+                        int(model_config["warm_start_epochs"])
+                        if warm_start_enabled
+                        else 0
+                    ),
+                    "warm_start_learning_rate": (
+                        float(
+                            model_config["learning_rate"]
+                            * model_config["warm_start_learning_rate_factor"]
+                        )
+                        if warm_start_enabled
+                        else None
+                    ),
+                    "algorithmic_model_state_count": algorithmic_model_state_count,
+                    "local_training_invocation_count": local_training_invocation_count,
+                    "total_training_epochs": total_training_epochs,
+                },
                 "includes_zero_budget_checkpoint": False,
                 "budget_unit": "fraction_of_full_training_set",
                 "budget_checkpoint_target_counts": target_counts[1:].tolist(),

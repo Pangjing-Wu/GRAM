@@ -262,9 +262,12 @@ def cleannet_score(
     queried_status: np.ndarray,
     seed: int,
 ) -> np.ndarray:
-    """CleanNet-style shared relevance head with B-limited clean references."""
+    """Cross-modal CleanNet-style relevance head using backbone embeddings."""
     labels = np.asarray(noisy_labels, dtype=np.int64)
-    embedding = np.asarray(artifacts.embedding, dtype=np.float64)
+    # ResNet, RoBERTa, and the tabular MLP all expose their penultimate
+    # representations through the same training-artifact interface.  Work on a
+    # copy so cosine normalization cannot mutate artifacts used by other logic.
+    embedding = np.array(artifacts.embedding, dtype=np.float64, copy=True)
     embedding /= np.maximum(np.linalg.norm(embedding, axis=1, keepdims=True), 1.0e-12)
     similarity = np.zeros(len(labels), dtype=np.float64)
     has_reference = np.zeros(len(labels), dtype=np.float64)

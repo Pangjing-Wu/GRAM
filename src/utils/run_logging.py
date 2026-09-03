@@ -12,6 +12,16 @@ LOGGER_NAME = "data_model_coevo.run"
 run_logger = logging.getLogger(LOGGER_NAME)
 
 
+def ensure_output_available(output_dir: str | Path, overwrite: bool = False) -> None:
+    """Refuse to mix a new run with files from an existing result."""
+    output_dir = Path(output_dir)
+    if output_dir.is_dir() and any(output_dir.iterdir()) and not overwrite:
+        raise FileExistsError(
+            f"result directory is not empty: {output_dir}; "
+            "pass --overwrite to replace result files"
+        )
+
+
 def write_run_arguments(
     output_dir: str | Path, arguments: Mapping[str, Any]
 ) -> Path:
@@ -25,7 +35,9 @@ def write_run_arguments(
     return path
 
 
-def configure_run_logging(output_dir: str | Path) -> logging.Logger:
+def configure_run_logging(
+    output_dir: str | Path, *, overwrite: bool = False
+) -> logging.Logger:
     """Write one run's lifecycle and progress to its result directory."""
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -44,7 +56,7 @@ def configure_run_logging(output_dir: str | Path) -> logging.Logger:
     formatter.converter = time.gmtime
 
     file_handler = logging.FileHandler(
-        output_dir / "run.log", mode="a", encoding="utf-8"
+        output_dir / "run.log", mode="w" if overwrite else "a", encoding="utf-8"
     )
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
