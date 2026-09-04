@@ -133,6 +133,25 @@ METHOD_CONFIGS = {
         "variant": "aum_b_style_stratified_verification_calibration",
         "quantile_bins": 10,
     },
+    "forgetting_b": {
+        "source": "https://arxiv.org/abs/1812.05159",
+        "base_score": "forgetting_events_with_never_learned_ranked_last",
+        "variant": "aum_b_style_stratified_verification_calibration",
+        "quantile_bins": 10,
+    },
+    "early_loss_b": {
+        "source": "https://www.vldb.org/pvldb/vol17/p1159-chai.pdf",
+        "base_score": "mean_cross_entropy_over_configured_early_epochs",
+        "variant": "non_iterative_early_loss_with_verification_calibration",
+        "quantile_bins": 10,
+    },
+    "cleanlab_b": {
+        "source": "https://github.com/cleanlab/cleanlab",
+        "base_score": "one_minus_normalized_margin_label_quality",
+        "predicted_probabilities": "shared_task_model_training_set_inference",
+        "variant": "verification_adapted_score_calibration",
+        "quantile_bins": 10,
+    },
     "knn_label_disagreement_b": {
         "source": "AMADE",
         "base_score": "knn_label_disagreement",

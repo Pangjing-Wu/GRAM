@@ -12,6 +12,29 @@ LOGGER_NAME = "data_model_coevo.run"
 run_logger = logging.getLogger(LOGGER_NAME)
 
 
+def completed_run_exists(
+    output_dir: str | Path,
+    *,
+    protocol: str,
+    required_files: tuple[str, ...] = (),
+) -> bool:
+    """Return whether an output directory contains a completed run."""
+    output_dir = Path(output_dir)
+    if any(not (output_dir / name).is_file() for name in required_files):
+        return False
+
+    log_path = output_dir / "run.log"
+    if not log_path.is_file():
+        return False
+
+    completion_marker = f"run_completed protocol={protocol}"
+    try:
+        with log_path.open(encoding="utf-8") as stream:
+            return any(completion_marker in line for line in stream)
+    except OSError:
+        return False
+
+
 def ensure_output_available(output_dir: str | Path, overwrite: bool = False) -> None:
     """Refuse to mix a new run with files from an existing result."""
     output_dir = Path(output_dir)

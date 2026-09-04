@@ -15,6 +15,9 @@ from ..utils.neighbors import faiss_neighbors
 SCORE_CALIBRATION_METHODS = (
     "aum_b",
     "el2n_b",
+    "forgetting_b",
+    "early_loss_b",
+    "cleanlab_b",
     "knn_label_disagreement_b",
     "moderate_b",
 )
@@ -22,6 +25,9 @@ SCORE_CALIBRATION_METHODS = (
 _RAW_METHOD = {
     "aum_b": "aum",
     "el2n_b": "el2n",
+    "forgetting_b": "forgetting",
+    "early_loss_b": "early_loss",
+    "cleanlab_b": "cleanlab",
     "knn_label_disagreement_b": "knn_label_disagreement",
     "moderate_b": "moderate",
 }
@@ -49,6 +55,22 @@ def _knn_label_disagreement(
         features, min(neighbors, len(features) - 1), normalize=False
     )
     return np.mean(labels[indices] != labels[:, None], axis=1)
+
+
+def _cleanlab_risk(probability: np.ndarray, labels: np.ndarray) -> np.ndarray:
+    try:
+        from cleanlab.rank import get_label_quality_scores
+    except ImportError as exc:
+        raise ImportError(
+            "cleanlab_b requires the cleanlab package; install requirements.txt"
+        ) from exc
+    quality = get_label_quality_scores(
+        labels,
+        probability,
+        method="normalized_margin",
+        adjust_pred_probs=False,
+    )
+    return 1.0 - np.asarray(quality, dtype=np.float64)
 
 
 def _moderate_risk(features: np.ndarray, labels: np.ndarray) -> np.ndarray:
@@ -79,6 +101,12 @@ def base_mislabel_score(
         score = -np.asarray(artifacts.aum, dtype=np.float64)
     elif raw_method == "el2n":
         score = _el2n(probability, labels)
+    elif raw_method == "forgetting":
+        score = np.asarray(artifacts.forgetting, dtype=np.float64)
+    elif raw_method == "early_loss":
+        score = np.asarray(artifacts.early_loss, dtype=np.float64)
+    elif raw_method == "cleanlab":
+        score = _cleanlab_risk(probability, labels)
     elif raw_method == "knn_label_disagreement":
         score = _knn_label_disagreement(
             _features(artifacts, feature_override), labels

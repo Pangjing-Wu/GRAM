@@ -23,9 +23,20 @@ from src.detection_experiment import (
 from src.methods import METHODS
 from src.utils.budget import noise_rate_budget_checkpoints
 from src.utils.run_logging import (
+    completed_run_exists,
     configure_run_logging,
     ensure_output_available,
     write_run_arguments,
+)
+
+
+DETECTION_RESULT_FILES = (
+    "run_args.json",
+    "metrics.csv",
+    "queries.csv",
+    "predictions.csv",
+    "summary.json",
+    "config.json",
 )
 
 
@@ -83,6 +94,16 @@ def main() -> None:
         scenario,
         selected_gram_variant,
     )
+    if not args.overwrite and completed_run_exists(
+        output,
+        protocol="full_pool_detection",
+        required_files=DETECTION_RESULT_FILES,
+    ):
+        print(
+            f"WARNING: completed result already exists; skipping: {output}",
+            file=sys.stderr,
+        )
+        return
     ensure_output_available(output, args.overwrite)
     write_run_arguments(
         output,

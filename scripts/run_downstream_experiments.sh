@@ -2,9 +2,9 @@
 set -euo pipefail
 
 # Quick validation (image, text, tabular):
-# bash scripts/run_downstream_experiments.sh --datasets cifar10 atis adult --methods ours --noise-types symmetric pairflip instance --rhos 0.2 --seeds 0 --gpus 0 1
+# bash scripts/run_downstream_experiments.sh --datasets cifar10 atis adult --methods ours forgetting_b early_loss_b cleanlab_b --noise-types symmetric pairflip instance --rhos 0.2 --seeds 0 --gpus 0 1
 # Full grid (all valid combinations):
-# bash scripts/run_downstream_experiments.sh --datasets cifar10 cifar100 atis qnli adult letter --methods aum_b el2n_b knn_label_disagreement_b moderate_b robust_alc robust_alc_frozen dalc dalc_frozen active_label_cleaning active_label_correction graph_label_propagation cleannet misdetect_b ours --noise-types symmetric pairflip instance --rhos 0.2 0.4 --seeds 0 1 2 --gpus 0 1 2 3
+# bash scripts/run_downstream_experiments.sh --datasets cifar10 cifar100 atis qnli adult letter --methods aum_b el2n_b forgetting_b early_loss_b cleanlab_b knn_label_disagreement_b moderate_b robust_alc robust_alc_frozen dalc dalc_frozen active_label_cleaning active_label_correction graph_label_propagation cleannet misdetect_b ours --noise-types symmetric pairflip instance --rhos 0.2 0.4 --seeds 0 1 2 --gpus 0 1 2 3
 # GRAM ablations: use scripts/run_gram_ablations.sh instead.
 
 project_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -144,7 +144,7 @@ done
 
 for method in "${methods[@]}"; do
   case "$method" in
-    aum_b|el2n_b|knn_label_disagreement_b|moderate_b|robust_alc|robust_alc_frozen|dalc|dalc_frozen|active_label_cleaning|active_label_correction|graph_label_propagation|cleannet|misdetect_b|ours) ;;
+    aum_b|el2n_b|forgetting_b|early_loss_b|cleanlab_b|knn_label_disagreement_b|moderate_b|robust_alc|robust_alc_frozen|dalc|dalc_frozen|active_label_cleaning|active_label_correction|graph_label_propagation|cleannet|misdetect_b|ours) ;;
     *) die "unsupported method: $method" ;;
   esac
 done
