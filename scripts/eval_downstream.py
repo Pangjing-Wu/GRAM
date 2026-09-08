@@ -12,6 +12,10 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Keep cache reads offline; missing assets are prepared by an online subprocess.
+for variable in ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE"):
+    os.environ[variable] = "1"
+
 from config.datasets import DATASETS
 from config.methods import GRAM_VARIANTS, resolve_gram_variant
 from config.path import PATHS

@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -12,7 +14,9 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from config.datasets import DATASETS
+from config.models import MODELS
 from config.path import PATHS
+from src.utils.local_data import load_local_huggingface, local_openml_path
 
 
 def parse_args() -> argparse.Namespace:
@@ -42,6 +46,8 @@ def download_cifar(config: dict, root: Path) -> None:
         "parquet",
         data_files=config["data_files"],
         cache_dir=str(root / "huggingface"),
+        # This path is entered only when the prepared Arrow cache is incomplete.
+        download_mode="reuse_cache_if_exists",
     )
 
 
@@ -51,29 +57,71 @@ def download_huggingface(config: dict, root: Path) -> None:
     arguments = [config["source"]]
     if "subset" in config:
         arguments.append(config["subset"])
-    load_dataset(*arguments, cache_dir=str(root / "huggingface"))
+    load_dataset(
+        *arguments, cache_dir=str(root / "huggingface"),
+        download_mode="reuse_cache_if_exists",
+    )
 
 
 def download_openml(config: dict, root: Path) -> None:
+    import joblib
     from sklearn.datasets import fetch_openml
 
+    output = local_openml_path(root, config)
+    if output.is_file():
+        return
     _, name, version = config["source"].split(":", maxsplit=2)
-    fetch_openml(
+    bunch = fetch_openml(
         name=name,
         version=int(version),
         data_home=str(root / "openml"),
+        as_frame=name == "adult",
     )
+    # Preserve Adult's categorical dtypes and row order for identical splits.
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=output.parent, suffix=".joblib", delete=False
+    ) as stream:
+        temporary = Path(stream.name)
+    try:
+        joblib.dump(bunch, temporary, compress=3)
+        os.replace(temporary, output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def download_text_assets(name: str, root: Path) -> None:
+    """Prepare the tokenizer and pretrained weights used by text experiments."""
+    from transformers import AutoModel, AutoTokenizer
+
+    model = MODELS[name]["model"]
+    for loader in (AutoTokenizer, AutoModel):
+        kwargs = {"cache_dir": str(root / "huggingface")}
+        if loader is AutoModel:
+            kwargs["add_pooling_layer"] = False
+        try:
+            asset = loader.from_pretrained(model, local_files_only=True, **kwargs)
+        except OSError:
+            asset = loader.from_pretrained(model, **kwargs)
+        del asset
 
 
 def download_dataset(name: str, root: Path) -> None:
     config = DATASETS[name]
     source = config["source"]
-    if name in {"cifar10", "cifar100"}:
-        download_cifar(config, root)
-    elif source.startswith("openml:"):
+    if source.startswith("openml:"):
         download_openml(config, root)
     else:
-        download_huggingface(config, root)
+        try:
+            load_local_huggingface(name, root, config)
+        except FileNotFoundError:
+            if name in {"cifar10", "cifar100"}:
+                download_cifar(config, root)
+            else:
+                download_huggingface(config, root)
+            load_local_huggingface(name, root, config)
+    if config["modality"] == "text":
+        download_text_assets(name, root)
 
 
 def main() -> None:
@@ -84,7 +132,7 @@ def main() -> None:
 
     failures: list[tuple[str, Exception]] = []
     for name in args.datasets:
-        print(f"[{name}] downloading...", flush=True)
+        print(f"[{name}] preparing local data...", flush=True)
         try:
             download_dataset(name, root)
         except Exception as error:  # Continue so independent downloads can finish.

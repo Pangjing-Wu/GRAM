@@ -299,6 +299,7 @@ class GaussianGraphGP:
             raise ValueError("observation noise variance must be positive")
 
     def posterior(self, observed_ids: np.ndarray, values: np.ndarray):
+        """Return mislabel probabilities, latent variances, and latent means."""
         observed_ids = np.asarray(observed_ids, dtype=np.int64)
         targets = 2.0 * np.asarray(values, dtype=np.float64) - 1.0
         features = _weighted_features(self.kernels, self.weights)
@@ -349,7 +350,7 @@ class GaussianGraphGP:
                 )
             )
         )
-        return probability, variance
+        return probability, variance, latent_mean
 
 
 def _simplex_weights(theta: np.ndarray, active: tuple[int, ...]) -> np.ndarray:
@@ -622,6 +623,7 @@ class GramPolicy:
         self._weight_fit = None
         self._posterior_key = None
         self._posterior_value = None
+        self._posterior_mean = None
 
     def _ensure_prior(self, artifacts) -> None:
         if self._diagnostics is None:
@@ -692,6 +694,7 @@ class GramPolicy:
                 self.config["identity_weight"],
             )
             self._weight_fit = None
+            self._posterior_mean = None
         else:
             mean = gaussian_prior_mean(self._diagnostics)
             if len(observed_ids) == 0:
@@ -719,7 +722,7 @@ class GramPolicy:
                 self._kernel_weights,
                 self.config["observation_noise_variance"],
             )
-            probability, variance = classifier.posterior(
+            probability, variance, self._posterior_mean = classifier.posterior(
                 observed_ids, observed_values
             )
 
@@ -805,6 +808,12 @@ class GramPolicy:
         )
         if self.config["acquisition"] == "posterior_variance":
             acquisition_score = variance
+        elif self.config["acquisition"] == "latent_ucb":
+            if self._posterior_mean is None:
+                raise ValueError("latent UCB requires Gaussian-surrogate inference")
+            acquisition_score = self._posterior_mean + self.config[
+                "ucb_beta"
+            ] * np.sqrt(np.maximum(variance, 0.0))
         elif self.config["acquisition"] == "ucb":
             acquisition_score = probability + np.sqrt(np.maximum(variance, 0.0))
         else:

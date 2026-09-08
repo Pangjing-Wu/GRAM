@@ -86,28 +86,37 @@ GRAM_VARIANTS = {
         "inference": "gaussian_surrogate",
         "acquisition": "posterior_variance",
     },
-    "abl_k10_ucb_legacy": {
-        "role": "legacy_combined_ablation",
-        "kernel": "legacy_joint_diagnostic_heat_kernel",
-        "kernel_normalization": "legacy_spectral_scaling",
-        "kernel_weight_parameterization": "fixed",
-        "gradient_trajectory": "unused",
-        "gaussian_target_encoding": "unused",
-        "mean_function": "ranked_joint_diagnostic_logit",
-        "marginal_likelihood_reduction": "unused",
-        "weight_optimizer": "unused",
-        "weight_update_schedule": "unused",
-        "diagnostic_neighbors": 10,
-        "graph_neighbors": 10,
-        "graph_rank": 64,
-        "identity_weight": 0.0,
-        "inference": "bernoulli_logistic_laplace",
-        "acquisition": "ucb",
-    },
 }
 
-# Keep the normal experiment path pinned to DEFAULT_GRAM_VARIANT.  Dedicated
-# ablation launchers can enumerate this tuple without duplicating the list.
+# Vary only the trajectory graphs; keep the diagnostic prior at the main k.
+# k=50 is already covered by DEFAULT_GRAM_VARIANT and need not be rerun.
+GRAM_VARIANTS.update(
+    {
+        f"abl_k{k}": {
+            **GRAM_VARIANTS[DEFAULT_GRAM_VARIANT],
+            "role": "graph_neighbors_ablation",
+            "diagnostic_neighbors": GRAM_VARIANTS[DEFAULT_GRAM_VARIANT]["graph_neighbors"],
+            "graph_neighbors": k,
+        }
+        for k in (10, 25, 100, 250)
+    }
+)
+
+# Acquisition-only ablations use the current adaptive mixture and Gaussian GP.
+# beta=0 is pure posterior-mean acquisition; sigma is the latent standard deviation.
+GRAM_VARIANTS.update(
+    {
+        f"abl_ucb_beta{str(beta).replace('.', 'p')}": {
+            **GRAM_VARIANTS[DEFAULT_GRAM_VARIANT],
+            "role": "acquisition_ablation",
+            "acquisition": "latent_ucb",
+            "ucb_beta": float(beta),
+        }
+        for beta in (0, 0.5, 1, 2)
+    }
+)
+
+# The dedicated ablation launcher runs every variant except the main setting.
 GRAM_ABLATION_VARIANTS = tuple(
     variant for variant in GRAM_VARIANTS if variant != DEFAULT_GRAM_VARIANT
 )

@@ -6,6 +6,8 @@ from typing import Any
 
 import numpy as np
 
+from .local_data import ensure_model_cached, load_dataset_or_download, prepare_dataset
+
 
 class ImageInputs:
     def __init__(self, source, image_column: str | None = None):
@@ -76,13 +78,7 @@ def _pooled_huggingface_image_features(dataset, image_column: str) -> np.ndarray
 
 
 def _load_cifar(name: str, root: Path, config: dict) -> TaskData:
-    from datasets import load_dataset
-
-    raw = load_dataset(
-        "parquet",
-        data_files=config["data_files"],
-        cache_dir=str(root / "huggingface"),
-    )
+    raw = load_dataset_or_download(name, root, config)
     train, test = raw["train"], raw["test"]
     image_column = config["image_column"]
     label_column = config["label_column"]
@@ -103,13 +99,22 @@ def _encode_texts(
     first: list[str],
     second: list[str] | None,
     *,
+    dataset_name: str,
     model_name: str,
     max_length: int,
     cache_dir: Path,
 ) -> dict[str, np.ndarray]:
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=str(cache_dir))
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name, cache_dir=str(cache_dir), local_files_only=True,
+        )
+    except OSError:
+        prepare_dataset(dataset_name, cache_dir.parent)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_name, cache_dir=str(cache_dir), local_files_only=True,
+        )
     encoded = tokenizer(
         first,
         text_pair=second,
@@ -132,9 +137,7 @@ def _hashed_text_features(first: list[str], second: list[str] | None):
 
 
 def _load_atis(root: Path, config: dict, model_config: dict) -> TaskData:
-    from datasets import load_dataset
-
-    raw = load_dataset(config["source"], cache_dir=str(root / "huggingface"))
+    raw = load_dataset_or_download("atis", root, config)
     train_rows = [row for row in raw["train"] if "+" not in row["intent"]]
     class_names = sorted({row["intent"] for row in train_rows})
     if len(class_names) != config["num_classes"]:
@@ -154,6 +157,7 @@ def _load_atis(root: Path, config: dict, model_config: dict) -> TaskData:
         train_x=_encode_texts(
             train_text,
             None,
+            dataset_name="atis",
             model_name=model_config["model"],
             max_length=model_config["max_length"],
             cache_dir=cache,
@@ -161,6 +165,7 @@ def _load_atis(root: Path, config: dict, model_config: dict) -> TaskData:
         test_x=_encode_texts(
             test_text,
             None,
+            dataset_name="atis",
             model_name=model_config["model"],
             max_length=model_config["max_length"],
             cache_dir=cache,
@@ -175,13 +180,7 @@ def _load_atis(root: Path, config: dict, model_config: dict) -> TaskData:
 
 
 def _load_qnli(root: Path, config: dict, model_config: dict) -> TaskData:
-    from datasets import load_dataset
-
-    raw = load_dataset(
-        config["source"],
-        config["subset"],
-        cache_dir=str(root / "huggingface"),
-    )
+    raw = load_dataset_or_download("qnli", root, config)
     train, test = raw["train"], raw["validation"]
     train_first, train_second = train["question"], train["sentence"]
     test_first, test_second = test["question"], test["sentence"]
@@ -192,6 +191,7 @@ def _load_qnli(root: Path, config: dict, model_config: dict) -> TaskData:
         train_x=_encode_texts(
             train_first,
             train_second,
+            dataset_name="qnli",
             model_name=model_config["model"],
             max_length=model_config["max_length"],
             cache_dir=cache,
@@ -199,6 +199,7 @@ def _load_qnli(root: Path, config: dict, model_config: dict) -> TaskData:
         test_x=_encode_texts(
             test_first,
             test_second,
+            dataset_name="qnli",
             model_name=model_config["model"],
             max_length=model_config["max_length"],
             cache_dir=cache,
@@ -211,17 +212,14 @@ def _load_qnli(root: Path, config: dict, model_config: dict) -> TaskData:
     )
 
 
-def _split_and_preprocess_adult(root: Path, seed: int):
+def _split_and_preprocess_adult(root: Path, seed: int, config: dict):
     from sklearn.compose import ColumnTransformer
-    from sklearn.datasets import fetch_openml
     from sklearn.impute import SimpleImputer
     from sklearn.model_selection import train_test_split
     from sklearn.pipeline import make_pipeline
     from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
-    bunch = fetch_openml(
-        "adult", version=2, as_frame=True, data_home=str(root / "openml")
-    )
+    bunch = load_dataset_or_download("adult", root, config)
     frame = bunch.data
     target = bunch.target.astype(str).str.strip().str.rstrip(".")
     labels = (target == ">50K").astype(np.int64).to_numpy()
@@ -258,19 +256,13 @@ def _split_and_preprocess_adult(root: Path, seed: int):
 
 def _load_tabular(name: str, root: Path, config: dict, seed: int) -> TaskData:
     if name == "adult":
-        train_x, test_x, train_y, test_y = _split_and_preprocess_adult(root, seed)
+        train_x, test_x, train_y, test_y = _split_and_preprocess_adult(root, seed, config)
         metadata = {}
     else:
-        from sklearn.datasets import fetch_openml
         from sklearn.model_selection import train_test_split
         from sklearn.preprocessing import LabelEncoder, StandardScaler
 
-        bunch = fetch_openml(
-            "letter",
-            version=1,
-            as_frame=False,
-            data_home=str(root / "openml"),
-        )
+        bunch = load_dataset_or_download(name, root, config)
         values = np.asarray(bunch.data, dtype=np.float32)
         encoder = LabelEncoder()
         labels = encoder.fit_transform(bunch.target).astype(np.int64)
@@ -304,11 +296,11 @@ def load_data(
     model_config: dict,
 ) -> TaskData:
     root = Path(root)
-    root.mkdir(parents=True, exist_ok=True)
     modality = dataset_config["modality"]
     if modality == "image":
         return _load_cifar(name, root, dataset_config)
     if modality == "text":
+        ensure_model_cached(name, root, model_config["model"])
         if name == "atis":
             return _load_atis(root, dataset_config, model_config)
         return _load_qnli(root, dataset_config, model_config)

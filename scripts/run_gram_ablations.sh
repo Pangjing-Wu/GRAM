@@ -11,14 +11,19 @@ usage() {
   cat <<EOF
 usage: $0 [--protocol detection|downstream|both] [--variants VARIANT...] [batch options]
 
-Run only GRAM ablations. By default, every registered non-main GRAM variant is
-evaluated under the detection protocol. All remaining options are forwarded to
-the corresponding batch runner; --datasets, --noise-types, --rhos, --seeds,
-and --gpus are required there.
+Run GRAM component, graph-neighbor, and acquisition ablations under detection
+by default. The k sweep adds 10, 25, 100, and 250; the existing main setting
+covers k=50. Acquisition variants use the main parameters with latent UCB
+(mean + beta * standard deviation), beta=0, 0.5, 1, 2.
+The main setting is excluded from the default sweep.
+All remaining options are forwarded to the corresponding batch runner;
+--datasets, --noise-types, --rhos, --seeds, and --gpus are required there.
 
 Examples:
   $0 --datasets cifar10 atis adult --noise-types symmetric --rhos 0.2 --seeds 0 --gpus 0
   $0 --protocol both --variants abl_no_identity abl_margin_only --datasets cifar10 --noise-types symmetric pairflip --rhos 0.2 --seeds 0 1 2 --gpus 0 1
+  $0 --variants abl_k10 abl_k25 abl_k100 abl_k250 --datasets cifar10 --noise-types symmetric --rhos 0.2 --seeds 0 --gpus 0
+  $0 --variants abl_ucb_beta0 abl_ucb_beta0p5 abl_ucb_beta1 abl_ucb_beta2 --datasets cifar10 --noise-types symmetric --rhos 0.2 --seeds 0 --gpus 0
 
 Do not pass --methods, --baselines, or --gram-variants: this launcher fixes the
 method to ours and manages the GRAM variants itself.
