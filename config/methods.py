@@ -5,7 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 
-DEFAULT_GRAM_VARIANT = "main_adaptive_mixture_uncertainty"
+DEFAULT_GRAM_VARIANT = "main_adaptive_mixture"
 
 GRAM_VARIANTS = {
     DEFAULT_GRAM_VARIANT: {
@@ -21,102 +21,84 @@ GRAM_VARIANTS = {
         "minimum_queried_for_weight_learning": 30,
         "require_both_status_classes_for_weight_learning": True,
         "inference": "gaussian_surrogate",
-        "acquisition": "posterior_variance",
-    },
-    "abl_fixed_uniform_weights": {
-        "role": "adaptive_weight_ablation",
-        "kernel_weight_parameterization": "fixed",
-        "marginal_likelihood_reduction": "unused",
-        "weight_optimizer": "unused",
-        "weight_update_schedule": "fixed_for_all_query_batches",
-        "graph_neighbors": 50,
-        "margin_graph_rank": 64,
-        "gradient_graph_rank": 64,
-        "kernel_weights": "fixed",
-        "active_kernel_components": ("margin", "gradient", "identity"),
-        "initial_kernel_weights": (1.0 / 3.0,) * 3,
-        "observation_noise_variance": 0.1,
-        "inference": "gaussian_surrogate",
-        "acquisition": "posterior_variance",
-    },
-    "abl_no_identity": {
-        "role": "identity_ablation",
-        "graph_neighbors": 50,
-        "margin_graph_rank": 64,
-        "gradient_graph_rank": 64,
-        "kernel_weights": "adaptive",
-        "active_kernel_components": ("margin", "gradient"),
-        "initial_kernel_weights": (0.5, 0.5, 0.0),
-        "observation_noise_variance": 0.1,
-        "weight_regularization": 0.1,
-        "minimum_queried_for_weight_learning": 30,
-        "require_both_status_classes_for_weight_learning": True,
-        "inference": "gaussian_surrogate",
-        "acquisition": "posterior_variance",
-    },
-    "abl_margin_only": {
-        "role": "gradient_and_identity_ablation",
-        "kernel_weight_parameterization": "fixed",
-        "marginal_likelihood_reduction": "unused",
-        "weight_optimizer": "unused",
-        "weight_update_schedule": "fixed_for_all_query_batches",
-        "graph_neighbors": 50,
-        "margin_graph_rank": 64,
-        "gradient_graph_rank": 64,
-        "kernel_weights": "fixed",
-        "active_kernel_components": ("margin",),
-        "initial_kernel_weights": (1.0, 0.0, 0.0),
-        "observation_noise_variance": 0.1,
-        "inference": "gaussian_surrogate",
-        "acquisition": "posterior_variance",
-    },
-    "abl_gradient_only": {
-        "role": "margin_and_identity_ablation",
-        "kernel_weight_parameterization": "fixed",
-        "marginal_likelihood_reduction": "unused",
-        "weight_optimizer": "unused",
-        "weight_update_schedule": "fixed_for_all_query_batches",
-        "graph_neighbors": 50,
-        "margin_graph_rank": 64,
-        "gradient_graph_rank": 64,
-        "kernel_weights": "fixed",
-        "active_kernel_components": ("gradient",),
-        "initial_kernel_weights": (0.0, 1.0, 0.0),
-        "observation_noise_variance": 0.1,
-        "inference": "gaussian_surrogate",
-        "acquisition": "posterior_variance",
+        "acquisition": "repair_plus_informative_value",
+        "iv_beta": 1.0,
+        "informative_value_pool": "all_unverified_including_query",
+        "informative_value_normalization": "mean_over_unverified",
     },
 }
+_GRAM_MAIN = GRAM_VARIANTS[DEFAULT_GRAM_VARIANT]
 
-# Vary only the trajectory graphs; keep the diagnostic prior at the main k.
-# k=50 is already covered by DEFAULT_GRAM_VARIANT and need not be rerun.
+GRAM_VARIANTS.update(
+    {
+        "abl_fixed_uniform_weights": {
+            **_GRAM_MAIN,
+            "role": "adaptive_weight_ablation",
+            "kernel_weights": "fixed",
+            "kernel_weight_parameterization": "fixed",
+            "marginal_likelihood_reduction": "unused",
+            "weight_optimizer": "unused",
+            "weight_update_schedule": "fixed_for_all_query_batches",
+        },
+        "abl_no_identity": {
+            **_GRAM_MAIN,
+            "role": "identity_ablation",
+            "active_kernel_components": ("margin", "gradient"),
+            "initial_kernel_weights": (0.5, 0.5, 0.0),
+        },
+        "abl_no_gradient": {
+            **_GRAM_MAIN,
+            "role": "gradient_ablation",
+            "active_kernel_components": ("margin", "identity"),
+            "initial_kernel_weights": (0.5, 0.0, 0.5),
+        },
+        "abl_no_margin": {
+            **_GRAM_MAIN,
+            "role": "margin_ablation",
+            "active_kernel_components": ("gradient", "identity"),
+            "initial_kernel_weights": (0.0, 0.5, 0.5),
+        },
+    }
+)
+# Vary trajectory neighbors only; main supplies k=50.
 GRAM_VARIANTS.update(
     {
         f"abl_k{k}": {
-            **GRAM_VARIANTS[DEFAULT_GRAM_VARIANT],
+            **_GRAM_MAIN,
             "role": "graph_neighbors_ablation",
-            "diagnostic_neighbors": GRAM_VARIANTS[DEFAULT_GRAM_VARIANT]["graph_neighbors"],
+            "diagnostic_neighbors": _GRAM_MAIN["graph_neighbors"],
             "graph_neighbors": k,
         }
         for k in (10, 25, 100, 250)
     }
 )
-
-# Acquisition-only ablations use the current adaptive mixture and Gaussian GP.
-# beta=0 is pure posterior-mean acquisition; sigma is the latent standard deviation.
 GRAM_VARIANTS.update(
     {
-        f"abl_ucb_beta{str(beta).replace('.', 'p')}": {
-            **GRAM_VARIANTS[DEFAULT_GRAM_VARIANT],
+        f"abl_{name}": {
+            **_GRAM_MAIN,
             "role": "acquisition_ablation",
-            "acquisition": "latent_ucb",
-            "ucb_beta": float(beta),
+            "acquisition": acquisition,
+            **({"iv_beta": 0.0} if name == "risk_only" else {}),
         }
-        for beta in (0, 0.5, 1, 2)
+        for name, acquisition in (
+            ("risk_only", "posterior_risk"),
+            ("iv_only", "informative_value"),
+            ("variance_only", "posterior_variance"),
+            ("local_only", "repair_plus_local_iv"),
+        )
     }
 )
-
-# The dedicated ablation launcher runs every variant except the main setting.
+# beta=0 is risk_only and beta=1 is the main setting. IV keeps its raw units.
+GRAM_VARIANTS.update(
+    {
+        f"abl_beta{str(beta).replace('.', 'p')}": {
+            **_GRAM_MAIN,
+            "role": "iv_beta_sensitivity",
+            "iv_beta": float(beta),
+        }
+        for beta in (0.1, 10, 100)
+    }
+)
 GRAM_ABLATION_VARIANTS = tuple(
     variant for variant in GRAM_VARIANTS if variant != DEFAULT_GRAM_VARIANT
 )

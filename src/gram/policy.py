@@ -291,6 +291,8 @@ class GaussianGraphGP:
         self.prior_mean = np.asarray(prior_mean, dtype=np.float64)
         self.weights = np.asarray(weights, dtype=np.float64)
         self.observation_noise_variance = float(observation_noise_variance)
+        self._covariance_features = None
+        self._observed_ids = None
         if self.weights.shape != (3,) or np.any(self.weights < 0.0):
             raise ValueError("kernel weights must be three non-negative values")
         if not np.isclose(self.weights.sum(), 1.0):
@@ -334,7 +336,12 @@ class GaussianGraphGP:
             ).T
             graph_variance = np.einsum("ij,ij->i", latent, latent)
         else:
+            latent = features
             graph_variance = np.zeros(len(self.prior_mean), dtype=np.float64)
+        # On unverified samples the posterior covariance is Z Z^T + alpha_I I.
+        # Keep Z for exact variance-reduction acquisition without a dense N x N GP.
+        self._covariance_features = latent
+        self._observed_ids = observed_ids.copy()
         variance = graph_variance + identity_weight
         if len(observed_ids) and identity_weight:
             shrinkage = self.observation_noise_variance / total_noise
@@ -351,6 +358,45 @@ class GaussianGraphGP:
             )
         )
         return probability, variance, latent_mean
+
+    def informative_value(self, unverified_ids: np.ndarray) -> np.ndarray:
+        """Mean latent variance reduction over the current unverified pool.
+
+        For i in U, IV(i) = ||Sigma[U, i]||^2 / (|U| (Sigma[i,i] + tau^2)).
+        The pool includes i and every unverified sample, even when some of them
+        are ineligible for selection. Weights are held fixed for this one-step
+        conditioning calculation; future weight learning is not predicted.
+        Values outside U are zero and are never eligible for acquisition.
+        """
+        if self._covariance_features is None:
+            raise RuntimeError("compute the GP posterior before informative value")
+        unverified_ids = np.asarray(unverified_ids, dtype=np.int64)
+        if unverified_ids.ndim != 1 or (
+            len(np.unique(unverified_ids)) != len(unverified_ids)
+        ):
+            raise ValueError("unverified indices must be a one-dimensional unique set")
+        if np.any(unverified_ids < 0) or np.any(unverified_ids >= len(self.prior_mean)):
+            raise ValueError("unverified index is outside the GP population")
+        if np.intersect1d(unverified_ids, self._observed_ids).size:
+            raise ValueError("informative value pool must exclude verified samples")
+        result = np.zeros(len(self.prior_mean), dtype=np.float64)
+        if not len(unverified_ids):
+            return result
+        latent = self._covariance_features[unverified_ids]
+        gram = latent.T @ latent
+        graph_variance = np.einsum("ij,ij->i", latent, latent)
+        identity_weight = float(self.weights[2])
+        # diag((Z Z^T + alpha_I I)^2), including identity cross/self terms.
+        column_norm_squared = (
+            np.einsum("ij,ij->i", latent @ gram, latent)
+            + 2.0 * identity_weight * graph_variance
+            + identity_weight**2
+        )
+        variance = graph_variance + identity_weight
+        result[unverified_ids] = np.maximum(column_norm_squared, 0.0) / (
+            len(unverified_ids) * (variance + self.observation_noise_variance)
+        )
+        return result
 
 
 def _simplex_weights(theta: np.ndarray, active: tuple[int, ...]) -> np.ndarray:
@@ -572,6 +618,7 @@ def select_gram(
     acquisition: str = "posterior_variance",
     candidate_mask: np.ndarray | None = None,
 ) -> QueryResult:
+    """Legacy logistic-GP selector; current experiments use GramPolicy.select."""
     probability, variance = predict_gram(
         diagnostics, graph, queried, queried_status, identity_weight
     )
@@ -624,6 +671,7 @@ class GramPolicy:
         self._posterior_key = None
         self._posterior_value = None
         self._posterior_mean = None
+        self._gaussian_gp = None
 
     def _ensure_prior(self, artifacts) -> None:
         if self._diagnostics is None:
@@ -695,6 +743,7 @@ class GramPolicy:
             )
             self._weight_fit = None
             self._posterior_mean = None
+            self._gaussian_gp = None
         else:
             mean = gaussian_prior_mean(self._diagnostics)
             if len(observed_ids) == 0:
@@ -725,6 +774,7 @@ class GramPolicy:
             probability, variance, self._posterior_mean = classifier.posterior(
                 observed_ids, observed_values
             )
+            self._gaussian_gp = classifier
 
         self._posterior_key = key
         self._posterior_value = probability, variance
@@ -806,22 +856,59 @@ class GramPolicy:
         probability, variance = self._posterior(
             artifacts, queried, queried_status
         )
-        if self.config["acquisition"] == "posterior_variance":
+        candidates = query_candidates(queried, candidate_mask)
+        if count < 0 or count > len(candidates):
+            raise ValueError(
+                "query count must be between zero and the number of eligible samples"
+            )
+        informative_value = None
+        acquisition = self.config["acquisition"]
+        if acquisition in (
+            "repair_plus_informative_value",
+            "informative_value",
+            "repair_plus_local_iv",
+        ):
+            if self._gaussian_gp is None:
+                raise ValueError(
+                    "informative value requires Gaussian-surrogate inference"
+                )
+            beta = float(self.config["iv_beta"])
+            if not np.isfinite(beta) or beta < 0.0:
+                raise ValueError("IV beta must be finite and non-negative")
+            unverified_ids = np.flatnonzero(~np.asarray(queried, dtype=bool))
+            if acquisition == "repair_plus_local_iv":
+                informative_value = np.zeros_like(variance)
+                if len(unverified_ids):
+                    local_variance = variance[unverified_ids]
+                    informative_value[unverified_ids] = np.square(local_variance) / (
+                        len(unverified_ids)
+                        * (local_variance + self.config["observation_noise_variance"])
+                    )
+            else:
+                informative_value = self._gaussian_gp.informative_value(unverified_ids)
+            acquisition_score = (
+                informative_value
+                if acquisition == "informative_value"
+                else probability + beta * informative_value
+            )
+        elif acquisition == "posterior_risk":
+            acquisition_score = probability
+        elif acquisition == "posterior_variance":
             acquisition_score = variance
-        elif self.config["acquisition"] == "latent_ucb":
+        elif acquisition == "latent_ucb":
             if self._posterior_mean is None:
                 raise ValueError("latent UCB requires Gaussian-surrogate inference")
             acquisition_score = self._posterior_mean + self.config[
                 "ucb_beta"
             ] * np.sqrt(np.maximum(variance, 0.0))
-        elif self.config["acquisition"] == "ucb":
+        elif acquisition == "ucb":
             acquisition_score = probability + np.sqrt(np.maximum(variance, 0.0))
         else:
             raise ValueError(
-                f"unknown GRAM acquisition function {self.config['acquisition']!r}"
+                f"unknown GRAM acquisition function {acquisition!r}"
             )
-        candidates = query_candidates(queried, candidate_mask)
-        if count > len(candidates):
-            raise ValueError("query count exceeds the number of eligible samples")
         selected = top_scores(acquisition_score, candidates, count, seed)
-        return QueryResult(selected, acquisition_score, variance)
+        return QueryResult(
+            selected, acquisition_score, variance,
+            repair_value=probability, informative_value=informative_value,
+        )

@@ -303,6 +303,11 @@ def run_downstream_experiment(
             if kernel_weight_state is not None:
                 query_row.update(
                     {
+                        "repair_value": float(result.repair_value[sample_id]),
+                        "informative_value": (
+                            float(result.informative_value[sample_id])
+                            if result.informative_value is not None else None
+                        ),
                         "omega_margin": kernel_weight_state["omega_margin"],
                         "omega_gradient": kernel_weight_state["omega_gradient"],
                         "omega_identity": kernel_weight_state["omega_identity"],

@@ -479,7 +479,9 @@ def _fit_model(
                 seed=scale_seed,
                 pair_count=contribution_config["distance_pairs"],
             )
-            update = np.exp(-np.square(epoch_losses) / sigma)
+            log_weight = -np.square(epoch_losses) / sigma
+            # Keep at least one exponential at one to avoid all-zero underflow.
+            update = np.exp(log_weight - log_weight.max())
             update /= update.sum()
             delta = contribution_config["contribution_step_size"]
             contribution = (1.0 - delta) * contribution + delta * update

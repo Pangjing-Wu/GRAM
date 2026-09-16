@@ -14,6 +14,8 @@ class QueryResult:
     score: np.ndarray
     posterior_variance: np.ndarray | None = None
     pseudo_selected: np.ndarray | None = None
+    repair_value: np.ndarray | None = None
+    informative_value: np.ndarray | None = None
 
 
 @dataclass
