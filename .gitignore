@@ -6,3 +6,5 @@ results/
 *.log
 *.pdf
 *.tex
+.trash
+/analysis/figures/

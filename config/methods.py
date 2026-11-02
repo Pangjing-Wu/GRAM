@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from itertools import product
+import json
 
 
 DEFAULT_GRAM_VARIANT = "main_adaptive_mixture"
@@ -96,12 +98,140 @@ GRAM_VARIANTS.update(
             "role": "iv_beta_sensitivity",
             "iv_beta": float(beta),
         }
-        for beta in (0.1, 10, 100)
+        for beta in (0.1, 10, 100, 1000, 10000)
     }
 )
 GRAM_ABLATION_VARIANTS = tuple(
     variant for variant in GRAM_VARIANTS if variant != DEFAULT_GRAM_VARIANT
 )
+
+# Cross beta with one existing setting at a time. Keep historical names so
+# completed single-factor experiments are reused in place.
+GRAM_GRID_BETAS = (0.0, 0.1, 1.0, 10.0, 100.0, 1000.0, 10000.0)
+GRAM_GRID_NEIGHBORS = (10, 25, 50, 100, 250)
+# Empirical beta=1 winners on macro-averaged unverified AUPRC area over the
+# common 0.001--0.20 budget window. Evidence: docs/gram_k_selection.md.
+GRAM_DATASET_NEIGHBORS = {
+    "cifar10": 25,
+    "cifar100": 100,
+    "atis": 250,
+    "qnli": 10,
+    "adult": 10,
+    "letter": 250,
+}
+GRAM_GRID_KERNELS = {
+    "adaptive": DEFAULT_GRAM_VARIANT,
+    "fixed_uniform_weights": "abl_fixed_uniform_weights",
+    "no_identity": "abl_no_identity",
+    "no_gradient": "abl_no_gradient",
+    "no_margin": "abl_no_margin",
+}
+GRAM_GRID_ACQUISITIONS = {
+    "repair_iv": "repair_plus_informative_value",
+    "local_only": "repair_plus_local_iv",
+    "risk_only": "posterior_risk",
+    "iv_only": "informative_value",
+    "variance_only": "posterior_variance",
+}
+
+
+def gram_grid_settings(reference_neighbors: int = 50) -> dict:
+    """Keep the k sweep; anchor all other controls at one fixed reference k."""
+    if reference_neighbors not in GRAM_GRID_NEIGHBORS:
+        raise ValueError(f"unsupported reference neighbors: {reference_neighbors}")
+    return {
+        DEFAULT_GRAM_VARIANT: (reference_neighbors, "adaptive", "repair_iv"),
+        **{f"abl_k{k}": (k, "adaptive", "repair_iv")
+           for k in GRAM_GRID_NEIGHBORS if k != reference_neighbors},
+        **{variant: (reference_neighbors, kernel, "repair_iv")
+           for kernel, variant in GRAM_GRID_KERNELS.items() if kernel != "adaptive"},
+        **{f"abl_{acquisition}": (reference_neighbors, "adaptive", acquisition)
+           for acquisition in GRAM_GRID_ACQUISITIONS if acquisition != "repair_iv"},
+    }
+
+
+GRAM_GRID_SETTINGS = gram_grid_settings()
+
+
+def _gram_config_key(config: dict) -> str:
+    effective = {key: value for key, value in config.items() if key != "role"}
+    effective.setdefault("diagnostic_neighbors", config["graph_neighbors"])
+    return json.dumps(effective, sort_keys=True)
+
+
+_gram_config_names = {
+    _gram_config_key(config): name for name, config in GRAM_VARIANTS.items()
+}
+_GRAM_GRID_LOOKUP = {}
+_gram_grid_structures = tuple(dict.fromkeys(
+    setting for reference in GRAM_GRID_NEIGHBORS
+    for setting in gram_grid_settings(reference).values()
+))
+for _beta, (_k, _kernel, _acquisition) in product(
+    GRAM_GRID_BETAS, _gram_grid_structures,
+):
+    _config = {
+        **GRAM_VARIANTS[GRAM_GRID_KERNELS[_kernel]],
+        "role": "hyperparameter_grid",
+        "graph_neighbors": _k,
+        "diagnostic_neighbors": _GRAM_MAIN["graph_neighbors"],
+        "acquisition": GRAM_GRID_ACQUISITIONS[_acquisition],
+        "iv_beta": _beta,
+    }
+    # beta=0 makes both repair + IV policies identical to risk-only. The other
+    # controls do not use beta, so run them once in their default setting.
+    if _config["acquisition"] == "posterior_risk" or (
+        _beta == 0 and _acquisition in ("repair_iv", "local_only")
+    ):
+        _config.update(acquisition="posterior_risk", iv_beta=0.0)
+    elif _acquisition in ("iv_only", "variance_only"):
+        _config["iv_beta"] = 1.0
+    _key = _gram_config_key(_config)
+    if _key not in _gram_config_names:
+        _suffix = {
+            "posterior_risk": "risk_only",
+            "informative_value": "iv_only",
+            "posterior_variance": "variance_only",
+        }.get(_config["acquisition"])
+        if _suffix is None:
+            _suffix = f"{_acquisition}_beta{_beta:g}".replace(".", "p")
+        _name = f"grid_{_kernel}_k{_k}_{_suffix}"
+        GRAM_VARIANTS[_name] = _config
+        _gram_config_names[_key] = _name
+    _GRAM_GRID_LOOKUP[(_beta, _k, _kernel, _acquisition)] = _gram_config_names[_key]
+
+
+def gram_grid_variants(
+    *, betas=GRAM_GRID_BETAS, neighbors=GRAM_GRID_NEIGHBORS,
+    kernels=tuple(GRAM_GRID_KERNELS), acquisitions=tuple(GRAM_GRID_ACQUISITIONS),
+    reference_neighbors: int = 50,
+) -> tuple[str, ...]:
+    """Cross beta with the single-factor settings that match the filters.
+
+    K controls use the full kernel and repair+IV. Kernel/acquisition controls
+    stay at reference_neighbors, rather than crossing all values of k.
+    """
+    axes = (tuple(betas), tuple(neighbors), tuple(kernels), tuple(acquisitions))
+    for values, supported in zip(axes, (
+        GRAM_GRID_BETAS, GRAM_GRID_NEIGHBORS,
+        GRAM_GRID_KERNELS, GRAM_GRID_ACQUISITIONS,
+    )):
+        if not values or any(value not in supported for value in values):
+            raise ValueError(f"grid values {values!r} must be drawn from {tuple(supported)!r}")
+    settings = set(gram_grid_settings(reference_neighbors).values())
+    variants = tuple(dict.fromkeys(
+        _GRAM_GRID_LOOKUP[key] for key in product(*axes) if key[1:] in settings
+    ))
+    if not variants:
+        raise ValueError(
+            "no single-factor settings match these filters; vary only one of "
+            f"kernels or acquisitions at reference k={reference_neighbors}, "
+            "or select adaptive kernels and repair_iv for the k sweep"
+        )
+    return variants
+
+
+GRAM_GRID_VARIANTS = gram_grid_variants()
 
 ACTIVE_LABEL_CORRECTION = {
     "neighbors": 10,

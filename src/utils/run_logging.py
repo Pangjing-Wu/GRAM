@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import csv
 import json
 import logging
+import math
 import time
 from collections.abc import Mapping
 from pathlib import Path
@@ -10,6 +12,34 @@ from typing import Any
 
 LOGGER_NAME = "data_model_coevo.run"
 run_logger = logging.getLogger(LOGGER_NAME)
+
+
+def completed_downstream_run_exists(output_dir: str | Path) -> bool:
+    """Recognize the compact numerical protocol without a log or summary file."""
+    output = Path(output_dir)
+    try:
+        config = json.loads((output / "config.json").read_text())
+        if not isinstance(config, dict):
+            return False
+        with (output / "downstream_metrics.csv").open(newline="", encoding="utf-8") as stream:
+            rows = list(csv.DictReader(stream))
+        budgets = config["evaluated_checkpoints"]
+        expected = {("noisy", 0.0), ("clean", None)} | {
+            (setting, budget) for setting in ("repair_only", "repair_otsu") for budget in budgets
+        }
+        actual = {
+            (row["setting"], float(row["configured_budget_fraction"]) if row["configured_budget_fraction"] else None)
+            for row in rows
+        }
+        return (
+            config.get("protocol") == "downstream_repair_otsu"
+            and config.get("status") == "complete"
+            and len(rows) == config["expected_rows"] == len(expected)
+            and actual == expected
+            and all(math.isfinite(float(row["downstream_test_performance"])) for row in rows)
+        )
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
 
 
 def completed_run_exists(

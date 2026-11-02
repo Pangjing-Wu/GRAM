@@ -24,6 +24,7 @@ from .methods import (
 )
 from .utils.budget import budget_schedule, validate_budget_checkpoints
 from .utils.data import load_data
+from .utils.detection_results import DETECTION_SNAPSHOTS_FILE, save_detection_snapshots
 from .utils.noise import inject_noise
 from .utils.results import round_metric_floats
 from .utils.run_logging import run_logger
@@ -115,6 +116,11 @@ def run_detection_experiment(
     if method not in METHODS:
         raise ValueError(f"unknown method {method!r}; choose from {METHODS}")
     selected_gram_variant = resolve_gram_variant(method, gram_variant)
+    output = detection_output_dir(
+        Path(results_root), dataset, method, scenario, selected_gram_variant
+    )
+    # An interrupted overwrite must not leave an old completion artifact usable.
+    (output / DETECTION_SNAPSHOTS_FILE).unlink(missing_ok=True)
     dataset_config, model_config = load_config(dataset)
     data_root, results_root = Path(data_root), Path(results_root)
     data = load_data(
@@ -134,6 +140,7 @@ def run_detection_experiment(
     )
     noisy_labels = np.asarray(noisy_labels, dtype=np.int64)
     training_labels = noisy_labels.copy()
+    repaired_labels = noisy_labels.copy()
     oracle = LabelVerificationOracle(noisy_labels, data.clean_train_y)
     configured_budgets = validate_budget_checkpoints(scenario.budgets)
     target_counts, increments = budget_schedule(data.sample_count, configured_budgets)
@@ -313,17 +320,26 @@ def run_detection_experiment(
                 }
             )
         global_score = np.asarray(prediction.score, dtype=np.float64)
+        predicted_issue = np.asarray(prediction.predicted_issue, dtype=bool)
         expected_shape = (data.sample_count,)
         if global_score.shape != expected_shape or not np.all(
             np.isfinite(global_score)
         ):
             raise RuntimeError("method did not produce one finite global score per sample")
+        if predicted_issue.shape != expected_shape:
+            raise RuntimeError("method did not produce one issue decision per sample")
         row = None
         if checkpoint_index > 0:
             detection_snapshots.append(
                 {
+                    "checkpoint": checkpoint_index,
+                    "configured_budget_fraction": configured_budget,
                     "score": global_score.copy(),
                     "queried": queried.copy(),
+                    "predicted_issue": predicted_issue.copy(),
+                    "repaired_labels": repaired_labels.copy(),
+                    "decision_rule": prediction.decision_rule,
+                    "prediction_seconds": time.perf_counter() - prediction_started,
                 }
             )
             queried_count = int(queried.sum())
@@ -435,6 +451,7 @@ def run_detection_experiment(
             query_rows.append(query_row)
         queried[selected] = True
         queried_status[selected] = verification.mislabel_status
+        repaired_labels[selected] = verification.true_labels
         if method in CORRECTION_METHODS:
             training_labels[selected] = verification.true_labels
         policy.register_pseudo_labels(
@@ -658,4 +675,7 @@ def run_detection_experiment(
             indent=2,
             sort_keys=True,
         )
+    save_detection_snapshots(
+        output, detection_snapshots, noisy_labels, data.clean_train_y
+    )
     return output

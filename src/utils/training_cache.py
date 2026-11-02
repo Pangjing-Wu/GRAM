@@ -144,6 +144,28 @@ def _load_artifacts(
     )
 
 
+def load_saved_training_artifact(
+    directory: str | Path,
+    *,
+    fingerprint: str,
+    expected_metadata: dict,
+    load_model_state: bool = False,
+) -> TrainingArtifacts:
+    """Read the historical artifact without creating or updating its cache."""
+    directory = Path(directory)
+    with (directory / "manifest.json").open(encoding="utf-8") as stream:
+        manifest = json.load(stream)
+    expected = json.loads(json.dumps(expected_metadata))
+    if manifest.get("fingerprint") != fingerprint or any(
+        manifest.get(key) != value for key, value in expected.items()
+    ):
+        raise ValueError(f"saved training artifact does not match detection: {directory}")
+    return _load_artifacts(
+        directory / "artifacts.npz", directory / "model_state.pt", manifest,
+        load_model_state=load_model_state,
+    )
+
+
 def load_or_create_shared_training_artifact(
     *,
     cache_root: str | Path,
