@@ -23,17 +23,26 @@ def completed_downstream_run_exists(output_dir: str | Path) -> bool:
             return False
         with (output / "downstream_metrics.csv").open(newline="", encoding="utf-8") as stream:
             rows = list(csv.DictReader(stream))
-        budgets = config["evaluated_checkpoints"]
-        expected = {("noisy", 0.0), ("clean", None)} | {
-            (setting, budget) for setting in ("repair_only", "repair_otsu") for budget in budgets
-        }
+        if config.get("protocol") == "downstream_reference":
+            reference = config["reference"]
+            if reference not in {"noisy", "clean"} or config["settings"] != [reference]:
+                return False
+            expected = {(reference, None if reference == "clean" else 0.0)}
+        elif config.get("protocol") == "downstream_repair_otsu":
+            budgets = config["evaluated_checkpoints"]
+            if config["settings"] != ["repair_only", "repair_otsu"]:
+                return False
+            expected = {
+                (setting, budget) for setting in ("repair_only", "repair_otsu") for budget in budgets
+            }
+        else:
+            return False
         actual = {
             (row["setting"], float(row["configured_budget_fraction"]) if row["configured_budget_fraction"] else None)
             for row in rows
         }
         return (
-            config.get("protocol") == "downstream_repair_otsu"
-            and config.get("status") == "complete"
+            config.get("status") == "complete"
             and len(rows) == config["expected_rows"] == len(expected)
             and actual == expected
             and all(math.isfinite(float(row["downstream_test_performance"])) for row in rows)

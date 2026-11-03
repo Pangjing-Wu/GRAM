@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate saved detection checkpoints; save only numeric results and config."""
+"""Evaluate saved repairs or independent noisy/clean references."""
 
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ for variable in ("HF_HUB_OFFLINE", "HF_DATASETS_OFFLINE", "TRANSFORMERS_OFFLINE"
 from config.datasets import DATASETS
 from config.methods import GRAM_GRID_BETAS, GRAM_VARIANTS, resolve_gram_variant
 from config.path import PATHS
-from src.downstream_experiment import DownstreamScenario, run_downstream_experiment
+from src.downstream_experiment import DownstreamScenario, run_downstream_experiment, run_downstream_reference
 from src.methods import METHODS
 from src.utils.run_logging import run_logger
 from scripts.best_k import get_best_k
@@ -29,7 +29,10 @@ from scripts.best_k import get_best_k
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", required=True, choices=sorted(DATASETS))
-    parser.add_argument("--method", required=True, choices=METHODS)
+    task = parser.add_mutually_exclusive_group(required=True)
+    task.add_argument("--method", choices=METHODS)
+    task.add_argument("--reference", choices=("noisy", "clean"),
+                      help="train unmodified noisy or clean labels independently of detection")
     gram_selection = parser.add_mutually_exclusive_group()
     gram_selection.add_argument(
         "--gram_variant", choices=tuple(GRAM_VARIANTS), default=None, metavar="VARIANT",
@@ -37,8 +40,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     gram_selection.add_argument("--beta", type=float, choices=GRAM_GRID_BETAS,
                                 help="select k for this dataset/noise/rho/beta using the shared API")
-    parser.add_argument("--noise_type", choices=("symmetric", "pairflip", "instance"), default="instance")
-    parser.add_argument("--rho", type=float, choices=(0.20, 0.40), default=0.20)
+    parser.add_argument("--noise_type", choices=("symmetric", "pairflip", "instance"))
+    parser.add_argument("--rho", type=float, choices=(0.20, 0.40))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--checkpoints", type=float, nargs="+", default=None,
@@ -47,7 +50,18 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--data-root", type=Path, default=PATHS.data_root)
     parser.add_argument("--results-root", type=Path, default=PATHS.results_root)
     parser.add_argument("--overwrite", action="store_true", help="replace downstream outputs only")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.seed < 0:
+        parser.error("--seed must be non-negative")
+    if args.reference:
+        if args.gram_variant is not None or args.beta is not None or args.checkpoints is not None:
+            parser.error("--reference cannot be combined with GRAM selection or --checkpoints")
+        if args.reference == "clean" and (args.noise_type is not None or args.rho is not None):
+            parser.error("the clean reference has no --noise_type or --rho")
+    if args.reference != "clean":
+        args.noise_type = args.noise_type or "instance"
+        args.rho = 0.2 if args.rho is None else args.rho
+    return args
 
 
 def main(argv=None) -> int:
@@ -63,6 +77,15 @@ def main(argv=None) -> int:
     handler.setFormatter(formatter)
     run_logger.addHandler(handler)
     try:
+        if args.reference:
+            output = run_downstream_reference(
+                dataset=args.dataset, reference=args.reference, seed=args.seed,
+                noise_type=args.noise_type, rho=args.rho,
+                data_root=args.data_root, results_root=args.results_root,
+                overwrite=args.overwrite,
+            )
+            run_logger.info("downstream_completed output=%s", output)
+            return 0
         if args.beta is not None and args.method != "ours":
             raise ValueError("--beta is only valid for --method ours")
         variant = args.gram_variant

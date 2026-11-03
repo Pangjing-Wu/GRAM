@@ -106,8 +106,28 @@ budget checkpoint**, the experiment trains two fresh models:
   always retained. There is no deletion-rate or histogram-bin hyperparameter;
   constant scores retain the whole pool.
 
-`noisy` and `clean` reference models are trained once per run. Their rows use
-checkpoint 0; the clean reference has an empty budget field. All models share
+`noisy` and `clean` references are separate tasks and need no detection results:
+
+```bash
+python scripts/eval_downstream.py --dataset cifar10 --reference noisy \
+  --noise_type symmetric --rho 0.2 --seed 0
+python scripts/eval_downstream.py --dataset cifar10 --reference clean --seed 0
+```
+
+The noisy reference uses the full training set with the original injected labels,
+without repair or filtering. It runs once per dataset/noise type/rho/seed, shared
+by all methods and GRAM variants. The clean reference uses the original clean
+labels and runs once per dataset/seed, shared across noise types and ratios.
+Their outputs are stored at:
+
+```text
+results/downstream/<dataset>/<noise_type>/rho<rho>/noisy/seed<seed>/
+results/downstream/<dataset>/clean/seed<seed>/
+```
+
+Each reference CSV contains one checkpoint-0 row; the clean reference has an
+empty budget field. Method tasks only train `repair_only` and `repair_otsu`.
+All models share
 the downstream initialization seed and the same update count, based on the
 original training-set size. DALC's internal pseudo labels are replayed for
 scoring only; they do not become expert-repaired downstream labels.
@@ -344,7 +364,9 @@ optional filters over existing results. For GRAM, it discovers the available
 betas and automatically chooses k for each `dataset / noise_type / rho / beta`
 using the shared best-k interface, then evaluates the selected variant's
 available complete seeds. Baselines use each existing complete detection run
-once. Completed downstream results are skipped unless `--overwrite` is supplied.
+once. The batch also deduplicates noisy and clean references across these
+selected scenarios. References and baselines finish before GRAM tasks start.
+Completed downstream results are skipped unless `--overwrite` is supplied.
 
 Downstream defaults to **4 independent processes per GPU**. Workers take the
 next job from a shared queue as soon as they finish, so task durations do not

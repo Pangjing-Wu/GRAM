@@ -112,6 +112,22 @@ def downstream_output_dir(root, dataset, method, scenario, gram_variant=None) ->
 _output_dir = downstream_output_dir
 
 
+def downstream_reference_output_dir(root, dataset, reference, seed, *, noise_type=None, rho=None) -> Path:
+    output = Path(root) / "downstream" / dataset
+    if reference == "clean":
+        if noise_type is not None or rho is not None:
+            raise ValueError("the clean reference has no noise_type or rho")
+    elif reference == "noisy":
+        if noise_type not in {"symmetric", "pairflip", "instance"} or rho not in {0.2, 0.4}:
+            raise ValueError("the noisy reference requires a noise_type and rho=0.2 or 0.4")
+        output = output / noise_type / f"rho{rho:g}"
+    else:
+        raise ValueError("reference must be noisy or clean")
+    if seed < 0:
+        raise ValueError("seed must be non-negative")
+    return output / reference / f"seed{seed}"
+
+
 def _result_row(data, labels, retained, queried, noise_mask, *, setting,
                 checkpoint, budget, threshold, model_config, seed, data_root):
     result = train_downstream_model(
@@ -154,6 +170,63 @@ def _result_row(data, labels, retained, queried, noise_mask, *, setting,
         "downstream_test_macro_f1": result.test_macro_f1,
         "downstream_train_seconds": result.train_seconds,
     }
+
+
+def run_downstream_reference(
+    *, dataset: str, reference: str, seed: int,
+    data_root: str | Path, results_root: str | Path,
+    noise_type: str | None = None, rho: float | None = None,
+    overwrite: bool = False,
+) -> Path:
+    """Train one shared unmodified-data reference without detection results."""
+    output = downstream_reference_output_dir(
+        results_root, dataset, reference, seed, noise_type=noise_type, rho=rho,
+    )
+    ensure_output_available(output, overwrite)
+    started = time.perf_counter()
+    data_root = Path(data_root)
+    dataset_config, model_config = load_config(dataset)
+    data = load_data(
+        dataset, root=data_root, seed=seed,
+        dataset_config=dataset_config, model_config=model_config,
+    )
+    labels = data.clean_train_y
+    noise_mask = np.zeros(data.sample_count, dtype=bool)
+    scenario = {"seed": seed}
+    if reference == "noisy":
+        labels, noise_mask = inject_noise(
+            data.clean_train_y, data.noise_x, noise_type=noise_type,
+            rho=rho, num_classes=data.num_classes, seed=seed,
+        )
+        labels = np.asarray(labels, dtype=np.int64)
+        if not np.array_equal(noise_mask, labels != data.clean_train_y):
+            raise RuntimeError("noise mask and labels disagree")
+        scenario.update(noise_type=noise_type, rho=rho)
+    downstream_seed = int(np.random.SeedSequence([seed, 65_537]).generate_state(1)[0])
+    config = {
+        "protocol": "downstream_reference", "status": "running",
+        "dataset": dataset, "method": None, "gram_variant": None,
+        "reference": reference, "scenario": scenario,
+        "evaluated_checkpoints": [], "settings": [reference], "expected_rows": 1,
+        "dataset_config": dataset_config, "model_config": model_config,
+        "downstream_initialization": "fresh_method_independent_seed",
+        "downstream_seed": downstream_seed,
+        "downstream_training_exposure_per_epoch": data.sample_count,
+    }
+    output.mkdir(parents=True, exist_ok=True)
+    _write_config(output / "config.json", config)
+    row = _result_row(
+        data, labels, np.ones(data.sample_count, dtype=bool),
+        np.zeros(data.sample_count, dtype=bool), noise_mask,
+        setting=reference, checkpoint=0, budget=None if reference == "clean" else 0.0,
+        threshold=None, model_config=model_config, seed=downstream_seed, data_root=data_root,
+    )
+    _write_csv(output / "downstream_metrics.csv", [row])
+    config.update(status="complete", elapsed_seconds=time.perf_counter() - started)
+    _write_config(output / "config.json", config)
+    run_logger.info("downstream_reference setting=%s performance=%.6f",
+                    reference, row["downstream_test_performance"])
+    return output
 
 
 def run_downstream_experiment(
@@ -214,8 +287,8 @@ def run_downstream_experiment(
         "score_source": detection.score_source,
         "score_replay_train_seconds": detection.replay_train_seconds,
         "filtering": {"rule": "exact_otsu", "fit_pool": "full_training_set", "delete_if": "unverified_and_score_gt_threshold"},
-        "settings": ["noisy", "clean", "repair_only", "repair_otsu"],
-        "expected_rows": 2 + 2 * len(selected),
+        "settings": ["repair_only", "repair_otsu"],
+        "expected_rows": 2 * len(selected),
         "downstream_initialization": "fresh_method_independent_seed",
         "downstream_seed": downstream_seed,
         "downstream_training_exposure_per_epoch": data.sample_count,
@@ -224,7 +297,6 @@ def run_downstream_experiment(
     _write_config(output / "config.json", config)
     rows = []
     full = np.ones(data.sample_count, dtype=bool)
-    empty = np.zeros(data.sample_count, dtype=bool)
 
     def train_and_save(labels, retained, queried, **metadata):
         row = _result_row(
@@ -239,8 +311,6 @@ def run_downstream_experiment(
             row["retained_count"], row["downstream_test_performance"],
         )
 
-    train_and_save(noisy_labels, full, empty, setting="noisy", checkpoint=0, budget=0.0, threshold=None)
-    train_and_save(data.clean_train_y, full, empty, setting="clean", checkpoint=0, budget=None, threshold=None)
     for snapshot in detection.snapshots:
         budget = float(snapshot["configured_budget_fraction"])
         if budget not in selected:

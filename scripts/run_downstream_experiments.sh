@@ -28,6 +28,8 @@ while (($#)); do
     -h|--help)
       echo "Usage: $0 --gpus ... [--workers-per-gpu N] [--datasets ...] [--methods ...] [--noise-types ...] [--rhos ...] [--seeds ...] [--betas ... | --gram-variants ...] [--results-root PATH] [--data-root PATH] [--dry-run] [--overwrite]"
       echo "Default: discover existing detection scenarios, betas and seeds; automatically select the best GRAM k per dataset/noise/rho/beta. Baselines use their completed detection runs."
+      echo "Shared references: noisy once per dataset/noise/rho/seed; clean once per dataset/seed."
+      echo "References and baselines finish before any GRAM jobs start."
       echo "Use --gram-variants to override automatic k selection with explicit saved configurations."
       echo "Completed downstream runs are skipped unless --overwrite is supplied."
       echo "Default: 4 independent processes per GPU; workers share a dynamic task queue. Use --workers-per-gpu 1 for one process per GPU."
@@ -164,10 +166,25 @@ for (dataset, noise, rho, beta), candidates in sorted(auto_groups.items()):
           f"k={choice['graph_neighbors']} variant={choice['gram_variant']} "
           f"(seeds={choice['seeds']})", file=sys.stderr)
 
+reference_scenarios = {(dataset, noise, rho, int(seed))
+                       for dataset, method, variant, noise, rho, seed in eligible}
+clean_seeds = {(dataset, seed) for dataset, noise, rho, seed in reference_scenarios}
+references = [(dataset, "clean", "-", "-", "-", str(seed))
+              for dataset, seed in sorted(clean_seeds)]
+references += [(dataset, "noisy", "-", noise, rho, str(seed))
+               for dataset, noise, rho, seed in sorted(reference_scenarios)]
+method_order = {method: index for index, method in enumerate(METHOD_CONFIGS)}
+eligible.sort(key=lambda job: (job[1] == "ours", method_order[job[1]],
+                               job[0], job[3], float(job[4]), int(job[5]), job[2]))
 jobs = []
-for job in eligible:
+counts = dict(references=0, baselines=0, GRAM=0)
+for job in references + eligible:
     dataset, method, variant, noise, rho, seed = job
-    output = args.results_root / "downstream" / dataset / noise / f"rho{rho}" / method
+    output = args.results_root / "downstream" / dataset
+    if method == "clean":
+        output /= "clean"
+    else:
+        output = output / noise / f"rho{rho}" / method
     if variant != "-":
         output /= variant
     output /= f"seed{seed}"
@@ -175,8 +192,11 @@ for job in eligible:
         completed += 1
         continue
     jobs.append(job)
+    counts["GRAM" if method == "ours" else "references" if method in {"clean", "noisy"} else "baselines"] += 1
 
-print(f"Planned {len(jobs)} downstream runs; skipped {incomplete} incomplete detection runs, "
+print(f"Planned {len(jobs)} downstream runs "
+      f"({counts['references']} references, {counts['baselines']} baselines, {counts['GRAM']} GRAM); "
+      f"skipped {incomplete} incomplete detection runs, "
       f"{incomplete_groups} incomplete k-selection groups "
       f"and {completed} completed downstream runs.", file=sys.stderr)
 for job in jobs:
@@ -207,8 +227,10 @@ def command_for(job):
     dataset, method, variant, noise, rho, seed = job
     command = ["conda", "run", "--no-capture-output", "-n", "torch231", "python",
                str(Path(project_root) / "scripts/eval_downstream.py"),
-               "--dataset", dataset, "--method", method,
-               "--noise_type", noise, "--rho", rho, "--seed", seed]
+               "--dataset", dataset, "--seed", seed]
+    command += ["--reference" if method in {"clean", "noisy"} else "--method", method]
+    if method != "clean":
+        command += ["--noise_type", noise, "--rho", rho]
     if variant != "-":
         command += ["--gram_variant", variant]
     return [*command, *extra_args]
@@ -221,9 +243,6 @@ if dry_run == "true":
 if not jobs:
     sys.exit(0)
 
-queue = Queue()
-for index, job in enumerate(jobs, 1):
-    queue.put((index, job))
 stopping, lock = Event(), Lock()
 active = set()
 
@@ -265,11 +284,26 @@ def interrupt(signum, frame):
 signal.signal(signal.SIGINT, interrupt)
 signal.signal(signal.SIGTERM, interrupt)
 slots = [gpu for _ in range(workers_per_gpu) for gpu in gpus]
-pool = ThreadPoolExecutor(max_workers=min(len(slots), len(jobs)))
+pool = None
 status = 0
 try:
-    futures = [pool.submit(worker, gpu) for gpu in slots[:len(jobs)]]
-    failures = sum(future.result() for future in futures)
+    failures = 0
+    indexed = list(enumerate(jobs, 1))
+    for phase, phase_jobs in (
+        ("references and baselines", [(i, job) for i, job in indexed if job[1] != "ours"]),
+        ("GRAM", [(i, job) for i, job in indexed if job[1] == "ours"]),
+    ):
+        if not phase_jobs:
+            continue
+        print(f"Phase: {phase} ({len(phase_jobs)} tasks)", file=sys.stderr, flush=True)
+        queue = Queue()
+        for item in phase_jobs:
+            queue.put(item)
+        pool = ThreadPoolExecutor(max_workers=min(len(slots), len(phase_jobs)))
+        futures = [pool.submit(worker, gpu) for gpu in slots[:len(phase_jobs)]]
+        failures += sum(future.result() for future in futures)
+        pool.shutdown(wait=True)
+        pool = None
     print(f"Finished {len(jobs)} downstream tasks; {failures} failed.", file=sys.stderr)
     status = int(failures > 0)
 except KeyboardInterrupt:
@@ -293,6 +327,7 @@ except KeyboardInterrupt:
                     pass
     status = 128 + interrupted_signal
 finally:
-    pool.shutdown(wait=True)
+    if pool is not None:
+        pool.shutdown(wait=True)
 sys.exit(status)
 PY
