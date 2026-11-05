@@ -229,7 +229,7 @@ def _replay_scores(output, config, summary, scenario, data, noisy_labels,
 
 def ensure_detection_results(
     *, dataset, method, scenario, data_root, results_root, gram_variant,
-    dataset_config, model_config, noisy_labels, clean_labels, data=None,
+    dataset_config, model_config, noisy_labels, clean_labels, data=None, checkpoints=None,
 ) -> DetectionResults:
     """Read matching results; recover missing snapshots without re-querying."""
     output = detection_output_dir(Path(results_root), dataset, method, scenario, gram_variant)
@@ -251,7 +251,22 @@ def ensure_detection_results(
         raise ValueError("saved detection summary does not match the query log")
     final_score = _final_scores(output, noisy_labels, batches)
     replay_seconds = 0.0
-    if (output / DETECTION_SNAPSHOTS_FILE).exists():
+    if checkpoints == (scenario.rho,) and scenario.budgets[-1] == scenario.rho:
+        # The saved final scores and cumulative expert feedback fully determine
+        # the final-budget downstream input; no intermediate score replay is needed.
+        queried = np.zeros(len(noisy_labels), dtype=bool)
+        repaired_labels = noisy_labels.copy()
+        for batch in batches:
+            for row in batch:
+                sample_id = int(row["sample_id"])
+                queried[sample_id] = True
+                repaired_labels[sample_id] = int(row["verified_label"])
+        snapshots = [dict(
+            checkpoint=len(scenario.budgets), configured_budget_fraction=scenario.rho,
+            score=final_score, queried=queried, repaired_labels=repaired_labels,
+        )]
+        source = "saved_final_predictions"
+    elif (output / DETECTION_SNAPSHOTS_FILE).exists():
         snapshots = load_detection_snapshots(
             output, budgets=scenario.budgets, noisy_labels=noisy_labels,
             clean_labels=clean_labels, target_counts=targets[1:],

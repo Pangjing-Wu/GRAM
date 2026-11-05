@@ -45,7 +45,7 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--checkpoints", type=float, nargs="+", default=None,
-        help="evaluate a subset of saved budget fractions; default: every saved checkpoint",
+        help="only the budget equal to --rho is supported (also the default)",
     )
     parser.add_argument("--data-root", type=Path, default=PATHS.data_root)
     parser.add_argument("--results-root", type=Path, default=PATHS.results_root)

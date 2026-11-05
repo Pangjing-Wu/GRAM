@@ -30,10 +30,12 @@ def completed_downstream_run_exists(output_dir: str | Path) -> bool:
             expected = {(reference, None if reference == "clean" else 0.0)}
         elif config.get("protocol") == "downstream_repair_otsu":
             budgets = config["evaluated_checkpoints"]
-            if config["settings"] != ["repair_only", "repair_otsu"]:
+            if config["scenario"]["rho"] not in budgets:
+                return False
+            if config["settings"] not in (["repair_otsu"], ["repair_only", "repair_otsu"]):
                 return False
             expected = {
-                (setting, budget) for setting in ("repair_only", "repair_otsu") for budget in budgets
+                (setting, budget) for setting in config["settings"] for budget in budgets
             }
         else:
             return False

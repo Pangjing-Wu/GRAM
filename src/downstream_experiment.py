@@ -249,7 +249,9 @@ def run_downstream_experiment(
             raise ValueError(f"selected {choice['gram_variant']} lacks completed seed{scenario.seed}")
         gram_variant = choice["gram_variant"]
     variant = resolve_gram_variant(method, gram_variant)
-    selected = validate_budget_checkpoints(scenario.budgets if checkpoints is None else checkpoints)
+    selected = validate_budget_checkpoints((scenario.rho,) if checkpoints is None else checkpoints)
+    if selected != (scenario.rho,):
+        raise ValueError("downstream only evaluates the budget equal to the noise rate")
     if not set(selected).issubset(scenario.budgets):
         raise ValueError("requested checkpoints must be present in the saved detection schedule")
     data_root, results_root = Path(data_root), Path(results_root)
@@ -268,13 +270,14 @@ def run_downstream_experiment(
     noisy_labels = np.asarray(noisy_labels, dtype=np.int64)
     if not np.array_equal(noise_mask, noisy_labels != data.clean_train_y):
         raise RuntimeError("noise mask and labels disagree")
-    # Recover and validate the complete score trajectory before any test evaluation.
+    # Read and validate the final detection scores before any test evaluation.
     detection = ensure_detection_results(
         dataset=dataset, method=method,
         scenario=DetectionScenario(scenario.noise_type, scenario.rho, scenario.budgets, scenario.seed),
         data_root=data_root, results_root=results_root, gram_variant=variant,
         dataset_config=dataset_config, model_config=model_config,
         noisy_labels=noisy_labels, clean_labels=data.clean_train_y, data=data,
+        checkpoints=selected,
     )
     downstream_seed = int(np.random.SeedSequence([scenario.seed, 65_537]).generate_state(1)[0])
     config = {
@@ -287,8 +290,8 @@ def run_downstream_experiment(
         "score_source": detection.score_source,
         "score_replay_train_seconds": detection.replay_train_seconds,
         "filtering": {"rule": "exact_otsu", "fit_pool": "full_training_set", "delete_if": "unverified_and_score_gt_threshold"},
-        "settings": ["repair_only", "repair_otsu"],
-        "expected_rows": 2 * len(selected),
+        "settings": ["repair_otsu"],
+        "expected_rows": len(selected),
         "downstream_initialization": "fresh_method_independent_seed",
         "downstream_seed": downstream_seed,
         "downstream_training_exposure_per_epoch": data.sample_count,
@@ -296,7 +299,6 @@ def run_downstream_experiment(
     output.mkdir(parents=True, exist_ok=True)
     _write_config(output / "config.json", config)
     rows = []
-    full = np.ones(data.sample_count, dtype=bool)
 
     def train_and_save(labels, retained, queried, **metadata):
         row = _result_row(
@@ -317,14 +319,11 @@ def run_downstream_experiment(
             continue
         threshold = otsu_threshold(snapshot["score"])
         queried, labels = snapshot["queried"], snapshot["repaired_labels"]
-        for setting, retained in (
-            ("repair_only", full),
-            ("repair_otsu", queried | (snapshot["score"] <= threshold)),
-        ):
-            train_and_save(
-                labels, retained, queried, setting=setting, checkpoint=int(snapshot["checkpoint"]),
-                budget=budget, threshold=threshold if setting == "repair_otsu" else None,
-            )
+        train_and_save(
+            labels, queried | (snapshot["score"] <= threshold), queried,
+            setting="repair_otsu", checkpoint=int(snapshot["checkpoint"]),
+            budget=budget, threshold=threshold,
+        )
     config.update(status="complete", elapsed_seconds=time.perf_counter() - started)
     _write_config(output / "config.json", config)
     # Remove only artifacts produced by the former downstream protocol on explicit overwrite.
